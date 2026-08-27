@@ -203,6 +203,33 @@ export interface ImportResult {
   flag_reason?: 'markup_heavy' | 'oversized';
 }
 
+const HASH_EPHEMERAL_FRONTMATTER_KEYS = [
+  'captured_at',
+  'ingested_at',
+  QUARANTINE_KEY,
+  CONTENT_FLAG_KEY,
+  EMBED_SKIP_KEY,
+];
+
+export function stableImportFrontmatter(frontmatter: Record<string, unknown>): Record<string, unknown> {
+  const stable = { ...frontmatter };
+  for (const key of HASH_EPHEMERAL_FRONTMATTER_KEYS) delete stable[key];
+  return stable;
+}
+
+export function computeImportContentHash(parsed: ParsedPage): string {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      title: parsed.title,
+      type: parsed.type,
+      compiled_truth: parsed.compiled_truth,
+      timeline: parsed.timeline,
+      frontmatter: stableImportFrontmatter(parsed.frontmatter),
+      tags: [...parsed.tags].sort(),
+    }))
+    .digest('hex');
+}
+
 const MAX_FILE_SIZE = 5_000_000; // 5MB
 
 /**
@@ -247,6 +274,24 @@ export async function importFromContent(
      * the version bump.
      */
     forceRechunk?: boolean;
+    /**
+     * Local-admin exact remediation only. Use a plain INSERT for the page row
+     * so the database uniqueness constraint is the atomic create-only gate.
+     * A concurrent creator wins or loses; this path never enters putPage's
+     * ON CONFLICT UPDATE branch.
+     */
+    createOnly?: boolean;
+    /**
+     * Local-admin exact merge only. The importer computes and verifies the
+     * approved postimage before writes, then locks the active source/slug row
+     * and rechecks its preimage hash inside the write transaction. Aliases are
+     * projected in that same transaction instead of the normal fail-soft
+     * post-commit path.
+     */
+    exactMerge?: {
+      expectedPreimageContentHash: string;
+      expectedPostimageContentHash: string;
+    };
     /**
      * v0.39.0.0 T1.5: active schema pack for type inference. When set, parseMarkdown
      * uses the pack's path_prefixes instead of the hardcoded gbrain-base table.
@@ -526,29 +571,6 @@ export async function importFromContent(
   // is real, unbounded embedding spend). Same bug class as the captured_at /
   // ingested_at fix above; the gate re-derives the markers deterministically
   // on the next import, so dropping them from the hash is safe.
-  const HASH_EPHEMERAL_FRONTMATTER_KEYS = [
-    'captured_at',
-    'ingested_at',
-    QUARANTINE_KEY,
-    CONTENT_FLAG_KEY,
-    EMBED_SKIP_KEY,
-  ];
-  const stableFrontmatter: Record<string, unknown> = { ...parsed.frontmatter };
-  for (const k of HASH_EPHEMERAL_FRONTMATTER_KEYS) {
-    delete stableFrontmatter[k];
-  }
-  // Hash includes all meaningful fields for idempotency.
-  const hash = createHash('sha256')
-    .update(JSON.stringify({
-      title: parsed.title,
-      type: parsed.type,
-      compiled_truth: parsed.compiled_truth,
-      timeline: parsed.timeline,
-      frontmatter: stableFrontmatter,
-      tags: parsed.tags.sort(),
-    }))
-    .digest('hex');
-
   const parsedPage: ParsedPage = {
     type: parsed.type,
     title: parsed.title,
@@ -557,9 +579,21 @@ export async function importFromContent(
     frontmatter: parsed.frontmatter,
     tags: parsed.tags,
   };
+  // Hash includes all meaningful fields for idempotency. Gate-owned audit
+  // markers are intentionally excluded by computeImportContentHash.
+  const hash = computeImportContentHash(parsedPage);
+  if (opts.createOnly && opts.exactMerge) {
+    throw new Error('[import] createOnly and exactMerge are mutually exclusive');
+  }
+  if (opts.exactMerge && hash !== opts.exactMerge.expectedPostimageContentHash) {
+    throw new Error(`[import] exact merge postimage hash mismatch for ${sourceId ?? 'default'}/${slug}`);
+  }
 
   const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
-  if (existing?.content_hash === hash && !opts.forceRechunk) {
+  if (opts.createOnly && existing) {
+    throw new Error(`[import] create-only page already exists: ${sourceId ?? 'default'}/${slug}`);
+  }
+  if (!opts.exactMerge && existing?.content_hash === hash && !opts.forceRechunk) {
     return { slug, status: 'skipped', chunks: 0, parsedPage };
   }
 
@@ -587,7 +621,7 @@ export async function importFromContent(
   // via the `?.` shape — no failure mode for fake engines.
   const fmId = (parsed.frontmatter as Record<string, unknown> | undefined)?.id;
   const fmIdStr = typeof fmId === 'string' && fmId.length > 0 ? fmId : null;
-  if (!opts.forceRechunk && engine.findDuplicatePage) {
+  if (!opts.exactMerge && !opts.forceRechunk && engine.findDuplicatePage) {
     let dup: { slug: string; id: number } | null = null;
     try {
       dup = await engine.findDuplicatePage(sourceId ?? 'default', {
@@ -730,7 +764,36 @@ export async function importFromContent(
   // for single-source callers.
   const txOpts = sourceId ? { sourceId } : undefined;
   await engine.transaction(async (tx) => {
-    if (existing) await tx.createVersion(slug, txOpts);
+    let preimageCreatedAt = existing?.created_at;
+    let preimageUpdatedAt = existing?.updated_at;
+    if (opts.exactMerge) {
+      const locked = await tx.executeRaw<{
+        id: number | string;
+        source_id: string;
+        slug: string;
+        content_hash: string;
+        created_at: Date | string;
+        updated_at: Date | string;
+        deleted_at: Date | string | null;
+      }>(`
+        SELECT id, source_id, slug, content_hash, created_at, updated_at, deleted_at
+          FROM pages
+         WHERE source_id = $1 AND slug = $2
+         FOR UPDATE
+      `, [sourceId ?? 'default', slug]);
+      if (locked.length !== 1 || locked[0].source_id !== (sourceId ?? 'default')
+        || locked[0].slug !== slug || locked[0].deleted_at !== null) {
+        throw new Error(`[import] exact merge requires one active preimage: ${sourceId ?? 'default'}/${slug}`);
+      }
+      if (locked[0].content_hash !== opts.exactMerge.expectedPreimageContentHash) {
+        throw new Error(`[import] exact merge preimage hash drift for ${sourceId ?? 'default'}/${slug}`);
+      }
+      preimageCreatedAt = new Date(locked[0].created_at);
+      preimageUpdatedAt = new Date(locked[0].updated_at);
+      await tx.createVersion(slug, txOpts);
+    } else if (existing) {
+      await tx.createVersion(slug, txOpts);
+    }
 
     // v0.29.1 — compute effective_date from frontmatter precedence chain.
     // Filename comes from importFromFile path (basename) or the slug tail
@@ -745,11 +808,11 @@ export async function importFromContent(
       slug,
       frontmatter: parsed.frontmatter,
       filename: filenameForChain,
-      updatedAt: existing?.updated_at ?? nowDate,
-      createdAt: existing?.created_at ?? nowDate,
+      updatedAt: preimageUpdatedAt ?? nowDate,
+      createdAt: preimageCreatedAt ?? nowDate,
     });
 
-    await tx.putPage(slug, {
+    const pageInput = {
       type: parsed.type,
       title: parsed.title,
       compiled_truth: parsed.compiled_truth,
@@ -773,7 +836,40 @@ export async function importFromContent(
       ingested_via: opts.ingested_via ?? null,
       // ingested_at is server-stamped at the engine layer when any
       // provenance write fires; never client-controlled.
-    }, txOpts);
+    };
+    if (opts.createOnly) {
+      const created = await tx.executeRaw<{ id: number | string }>(`
+        INSERT INTO pages (
+          source_id, slug, type, page_kind, title, compiled_truth, timeline,
+          frontmatter, content_hash, updated_at, effective_date,
+          effective_date_source, import_filename, chunker_version, source_path,
+          source_kind, source_uri, ingested_via, ingested_at
+        ) VALUES (
+          $1, $2, $3, 'markdown', $4, $5, $6, $7::text::jsonb, $8, now(),
+          $9::timestamptz, $10, $11, COALESCE($12::smallint, 1), $13,
+          $14, $15, $16,
+          CASE WHEN $14::text IS NOT NULL OR $15::text IS NOT NULL OR $16::text IS NOT NULL
+               THEN now() ELSE NULL END
+        )
+        RETURNING id
+      `, [
+        sourceId ?? 'default', slug, pageInput.type, pageInput.title,
+        pageInput.compiled_truth, pageInput.timeline,
+        JSON.stringify(pageInput.frontmatter), pageInput.content_hash,
+        pageInput.effective_date, pageInput.effective_date_source,
+        pageInput.import_filename, pageInput.chunker_version,
+        pageInput.source_path, pageInput.source_kind, pageInput.source_uri,
+        pageInput.ingested_via,
+      ]);
+      if (created.length !== 1) throw new Error(`[import] create-only insert failed: ${sourceId ?? 'default'}/${slug}`);
+    } else {
+      const written = await tx.putPage(slug, pageInput, txOpts);
+      if (opts.exactMerge && (written.source_id !== (sourceId ?? 'default')
+        || written.slug !== slug
+        || written.content_hash !== opts.exactMerge.expectedPostimageContentHash)) {
+        throw new Error(`[import] exact merge write identity mismatch for ${sourceId ?? 'default'}/${slug}`);
+      }
+    }
 
     // v0.40.3.0: stamp the contextual retrieval state columns alongside
     // the page write. updatePageContextualRetrievalState is a narrow
@@ -789,7 +885,7 @@ export async function importFromContent(
       );
     }
 
-    // Tag reconciliation: ADD-ONLY (v0.41.37.0 #1621).
+    // Tag reconciliation: ADD-ONLY for ordinary imports (v0.41.37.0 #1621).
     //
     // We deliberately do NOT delete existing tags here. The `tags` table has
     // no provenance column, and frontmatter tags are stripped from the stored
@@ -807,9 +903,27 @@ export async function importFromContent(
     // are additive metadata) and far preferable to silently losing enrichment
     // tags. Frontmatter-tag REMOVAL would require a `tag_source` provenance
     // column (deferred — see TODOS.md #1621-followup). addTag is idempotent
-    // (ON CONFLICT DO NOTHING), so re-adding existing tags is a no-op.
+    // (ON CONFLICT DO NOTHING), so re-adding existing tags is a no-op. Exact
+    // remediation merges are the deliberate exception: their reviewed
+    // postimage includes the complete tag set, which is projected under the
+    // same transaction and verified by strict readback.
+    if (opts.exactMerge) {
+      const expectedTags = new Set(parsed.tags);
+      const currentTags = await tx.getTags(slug, txOpts);
+      for (const tag of currentTags) {
+        if (!expectedTags.has(tag)) await tx.removeTag(slug, tag, txOpts);
+      }
+    }
     for (const tag of parsed.tags) {
       await tx.addTag(slug, tag, txOpts);
+    }
+
+    // Exact create treats aliases as part of the atomic page projection.
+    // Normal imports retain the historical fail-soft post-commit behavior
+    // below for compatibility with pre-v110 brains.
+    if (opts.createOnly || opts.exactMerge) {
+      const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
+      await tx.setPageAliases(slug, sourceId ?? 'default', aliasNorms);
     }
 
     if (chunks.length > 0) {
@@ -831,36 +945,40 @@ export async function importFromContent(
     // page. addLink throws when either endpoint is missing (master tightened
     // this in v0.18.x), so we wrap each pair in try/catch — guides imported
     // before their code repo syncs are common, and the missing edges land
-    // later via `gbrain reconcile-links` (Layer 8 D3, v0.21.0).
-    const codeRefs = extractCodeRefs(parsed.compiled_truth + '\n' + (parsed.timeline || ''));
-    // For doc↔impl edges, both endpoints are within the same source as the
-    // markdown page being imported. Cross-source edges (markdown in one
-    // source, code in another) currently fail with "page not found" — a
-    // faster failure mode than the pre-fix cross-product fan-out, which
-    // silently wired edges to whichever same-slug page Postgres returned
-    // first across sources.
-    const linkOpts = sourceId
-      ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId }
-      : undefined;
-    for (const ref of codeRefs) {
-      const codeSlug = slugifyCodePath(ref.path);
-      // Forward: markdown guide → code page (this guide documents that code)
-      try {
-        await tx.addLink(
-          slug, codeSlug,
-          ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path,
-          'documents', 'markdown', slug, 'compiled_truth',
-          linkOpts,
-        );
-      } catch { /* code page not yet imported — reconcile-links will catch it */ }
-      // Reverse: code page → markdown guide (this code is documented by the guide)
-      try {
-        await tx.addLink(
-          codeSlug, slug,
-          ref.path, 'documented_by', 'markdown', slug, 'compiled_truth',
-          linkOpts,
-        );
-      } catch { /* same reason — silent skip */ }
+    // later via `gbrain reconcile-links` (Layer 8 D3, v0.21.0). Exact create
+    // and remediation merge intentionally skip this automatic relation layer;
+    // their reviewed postimage is limited to page, tags, aliases, and chunks.
+    if (!opts.createOnly && !opts.exactMerge) {
+      const codeRefs = extractCodeRefs(parsed.compiled_truth + '\n' + (parsed.timeline || ''));
+      // For doc↔impl edges, both endpoints are within the same source as the
+      // markdown page being imported. Cross-source edges (markdown in one
+      // source, code in another) currently fail with "page not found" — a
+      // faster failure mode than the pre-fix cross-product fan-out, which
+      // silently wired edges to whichever same-slug page Postgres returned
+      // first across sources.
+      const linkOpts = sourceId
+        ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId }
+        : undefined;
+      for (const ref of codeRefs) {
+        const codeSlug = slugifyCodePath(ref.path);
+        // Forward: markdown guide → code page (this guide documents that code)
+        try {
+          await tx.addLink(
+            slug, codeSlug,
+            ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path,
+            'documents', 'markdown', slug, 'compiled_truth',
+            linkOpts,
+          );
+        } catch { /* code page not yet imported — reconcile-links will catch it */ }
+        // Reverse: code page → markdown guide (this code is documented by the guide)
+        try {
+          await tx.addLink(
+            codeSlug, slug,
+            ref.path, 'documented_by', 'markdown', slug, 'compiled_truth',
+            linkOpts,
+          );
+        } catch { /* same reason — silent skip */ }
+      }
     }
   });
 
@@ -871,15 +989,17 @@ export async function importFromContent(
   // import. Always called (even with []) so REMOVING an alias from frontmatter
   // clears its row — the content_hash includes non-timestamp frontmatter, so
   // an alias edit changes the hash and reaches this path (not the skip branch).
-  try {
-    const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
-    await engine.setPageAliases(slug, sourceId ?? 'default', aliasNorms);
-  } catch (e) {
-    if (!isUndefinedTableError(e)) {
-      warnOncePerProcess(
-        'setPageAliases:failed',
-        `[import] page_aliases projection failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
-      );
+  if (!opts.createOnly && !opts.exactMerge) {
+    try {
+      const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
+      await engine.setPageAliases(slug, sourceId ?? 'default', aliasNorms);
+    } catch (e) {
+      if (!isUndefinedTableError(e)) {
+        warnOncePerProcess(
+          'setPageAliases:failed',
+          `[import] page_aliases projection failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
     }
   }
 

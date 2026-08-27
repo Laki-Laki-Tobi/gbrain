@@ -2,6 +2,97 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.10] - 2026-08-28
+
+### Fixed
+- Return the normalized `page_aliases` projection from `get_page` alongside
+  tags so exact remediation callers can verify durable alias state instead of
+  relying only on frontmatter or `pages.content_hash`.
+
+## [0.42.59.9] - 2026-08-28
+
+### Fixed
+- `create_page_file_exact` now requires a lowercase canonical
+  `expected_postimage_content_hash`, rejects a mismatched parsed draft before
+  any write, and returns that approved hash after strict readback.
+- Exact create and exact merge now skip importer doc-to-code relation
+  extraction, preventing approved corpus remediation from creating automatic
+  links outside the exact page, tag, alias, version, and chunk projection.
+
+No schema migrations are included in this vendor patch.
+
+## [0.42.59.8] - 2026-08-28
+
+### Fixed
+- `put_page_file_exact` now invokes the canonical importer directly with
+  embedding disabled instead of delegating through ordinary `put_page`, so an
+  exact remediation merge cannot trigger repository write-through, auto-link,
+  timeline, facts, chronicle, or post-write lint hooks.
+- Exact merge tags and aliases are projected transactionally and verified with
+  strict page, type, tag, alias, source, and content-hash readback while the
+  locked preimage CAS remains unchanged.
+
+No schema migrations are included in this vendor patch.
+
+## [0.42.59.7] - 2026-08-28
+
+### Fixed
+- `put_page_file_exact` now requires exact preimage, private-file SHA-256,
+  and canonical postimage hashes. The canonical importer locks and rechecks
+  the active source/slug preimage inside its write transaction before creating
+  a version or changing the page graph, so a concurrent edit cannot be
+  overwritten by an already-reviewed draft.
+- Exact merge aliases are now projected in the same transaction as the page,
+  tags, chunks, and version while the normal `put_page` post-write behavior is
+  preserved through a module-private local-only gate.
+
+No schema migrations are included in this vendor patch.
+
+## [0.42.59.6] - 2026-08-28
+
+### Fixed
+- Exact rollback link restore now takes the canonical transaction-scoped
+  endpoint locks, including deleted endpoints, so it serializes with exact
+  zero-inbound soft-delete.
+- Exact purge preserves a purged alias slug's durable redirect to a live
+  canonical page while continuing to block surviving aliases that point at a
+  canonical purge target. Backup, verify, and rollback now attest that
+  preserved redirect projection explicitly.
+
+No schema migrations are included in this vendor patch.
+
+## [0.42.59.5] - 2026-08-28
+
+### Fixed
+- Exact create now uses a database-enforced insert-only canonical path and
+  verifies the complete `page_aliases` projection, preventing a concurrent
+  creator from being overwritten.
+- Exact zero-inbound soft-delete serializes with single and batch link writers;
+  an existing tombstone without durable operation evidence now requires the
+  explicit ambiguous-commit gate.
+- Exact purge enforces a three-day minimum tombstone age and zero active
+  inbound dependencies at plan and atomic apply, captures a consistent bounded
+  backup, and verifies the full cascaded/`SET NULL` dependent graph.
+
+No schema migrations are included in this vendor patch.
+
+## [0.42.59.4] - 2026-08-28
+
+### Added
+- Four local-admin operations provide source-scoped exact corpus remediation:
+  private-file creation of absent lowercase pages, hash-gated soft-delete,
+  deleted-identity-gated restore, and bounded allowlisted physical purge.
+- `purge_pages_exact` uses an immutable plan fingerprint, private crash-durable
+  graph backup, exact apply/readback, verify, transactional rollback, and
+  operator-gated ambiguous-commit recovery. It never falls through to the
+  broad age-based purge primitive and accepts at most 100 exact identities.
+
+### Changed
+- Canonical import hashing is exposed as a shared pure helper so exact-create
+  validation and normal ingestion cannot drift apart.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.3] - 2026-08-27
 
 ### Added

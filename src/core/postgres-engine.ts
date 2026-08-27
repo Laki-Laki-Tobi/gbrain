@@ -18,7 +18,7 @@ import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatch
 import type {
   DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow,
 } from './types.ts';
-import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
+import { MAX_SEARCH_LIMIT, TRANSACTION_SCOPE, clampSearchLimit } from './engine.ts';
 import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts';
 import { normalizeWeightForStorage } from './takes-fence.ts';
 import { executeRawJsonb } from './sql-query.ts';
@@ -887,6 +887,7 @@ export class PostgresEngine implements BrainEngine {
       const txEngine = Object.create(this) as PostgresEngine;
       Object.defineProperty(txEngine, 'sql', { get: () => tx });
       Object.defineProperty(txEngine, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });
+      Object.defineProperty(txEngine, TRANSACTION_SCOPE, { value: true });
       return fn(txEngine);
     }) as Promise<T>;
   }
@@ -2589,6 +2590,60 @@ export class PostgresEngine implements BrainEngine {
   }
 
   // Links
+  private async withLinkWriteTransaction<T>(fn: (engine: PostgresEngine) => Promise<T>): Promise<T> {
+    if ((this as unknown as Record<PropertyKey, unknown>)[TRANSACTION_SCOPE] === true) return fn(this);
+    return this.transaction((tx) => fn(tx as PostgresEngine));
+  }
+
+  private async lockActiveLinkEndpoints(
+    rows: Array<{ from_slug: string; to_slug: string; from_source_id: string; to_source_id: string }>,
+    requireAll: boolean,
+  ): Promise<void> {
+    const unique = new Map<string, { source_id: string; slug: string }>();
+    for (const row of rows) {
+      unique.set(`${row.from_source_id}\0${row.from_slug}`, { source_id: row.from_source_id, slug: row.from_slug });
+      unique.set(`${row.to_source_id}\0${row.to_slug}`, { source_id: row.to_source_id, slug: row.to_slug });
+    }
+    const endpoints = [...unique.values()].sort((left, right) =>
+      left.source_id.localeCompare(right.source_id) || left.slug.localeCompare(right.slug));
+    const locked = await executeRawJsonb<{ id: number | string }>(
+      this,
+      `SELECT p.id
+         FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(source_id text, slug text)
+         JOIN pages p ON p.source_id = v.source_id AND p.slug = v.slug
+        WHERE p.deleted_at IS NULL
+        ORDER BY p.source_id, p.slug
+        FOR KEY SHARE OF p`,
+      [],
+      [{ rows: endpoints }],
+    );
+    if (requireAll && locked.length !== endpoints.length) {
+      throw new Error('addLink failed: one or more active endpoints were not found');
+    }
+  }
+
+  private async lockLinkEndpointsIncludingDeleted(
+    endpoints: Array<{ source_id: string; slug: string }>,
+  ): Promise<void> {
+    const unique = [...new Map(endpoints.map((endpoint) => [
+      `${endpoint.source_id}\0${endpoint.slug}`, endpoint,
+    ])).values()].sort((left, right) =>
+      left.source_id.localeCompare(right.source_id) || left.slug.localeCompare(right.slug));
+    const locked = await executeRawJsonb<{ id: number | string }>(
+      this,
+      `SELECT p.id
+         FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(source_id text, slug text)
+         JOIN pages p ON p.source_id = v.source_id AND p.slug = v.slug
+        ORDER BY p.source_id, p.slug
+        FOR KEY SHARE OF p`,
+      [],
+      [{ rows: unique }],
+    );
+    if (locked.length !== unique.length) {
+      throw new Error('restoreLinkExact failed: one or more endpoints were not found');
+    }
+  }
+
   async addLink(
     from: string,
     to: string,
@@ -2604,42 +2659,40 @@ export class PostgresEngine implements BrainEngine {
       resolutionType?: 'qualified' | 'unqualified';
     },
   ): Promise<void> {
-    const sql = this.sql;
     const fromSrc = opts?.fromSourceId ?? 'default';
     const toSrc = opts?.toSourceId ?? 'default';
     const originSrc = opts?.originSourceId ?? 'default';
 
-    // Pre-check existence so we can throw a clear error (ON CONFLICT DO UPDATE
-    // returns 0 rows when source SELECT is empty, indistinguishable from missing
-    // page). Source-qualified — pre-v0.18 the bare slug check matched ANY source,
-    // letting addLink succeed even when the intended source row was missing.
-    const exists = await sql`
-      SELECT 1 FROM pages WHERE slug = ${from} AND source_id = ${fromSrc}
-      INTERSECT
-      SELECT 1 FROM pages WHERE slug = ${to} AND source_id = ${toSrc}
-    `;
-    if (exists.length === 0) {
-      throw new Error(`addLink failed: page "${from}" (source=${fromSrc}) or "${to}" (source=${toSrc}) not found`);
-    }
-    // Default link_source to 'markdown' for back-compat with pre-v0.13 callers.
-    // Mirror addLinksBatch's VALUES + JOIN-on-(slug, source_id) shape. The old
-    // `FROM pages f, pages t` cross-product fanned out across every source
-    // containing either slug, so a multi-source brain silently created edges
-    // pointing at the wrong pages.
     const src = linkSource ?? 'markdown';
-    await sql`
-      INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field, resolution_type)
-      SELECT f.id, t.id, v.link_type, v.context, v.link_source, o.id, v.origin_field, v.resolution_type
-      FROM (VALUES (${from}, ${to}, ${linkType || ''}, ${sanitizeForJsonb(context || '')}, ${src}, ${originSlug ?? null}, ${originField ?? null}, ${fromSrc}, ${toSrc}, ${originSrc}, ${opts?.resolutionType ?? null}))
-        AS v(from_slug, to_slug, link_type, context, link_source, origin_slug, origin_field, from_source_id, to_source_id, origin_source_id, resolution_type)
-      JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id
-      JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id
-      LEFT JOIN pages o ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
-      ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO UPDATE SET
-        context = EXCLUDED.context,
-        origin_field = EXCLUDED.origin_field,
-        resolution_type = EXCLUDED.resolution_type
-    `;
+    const rows = buildLinkRows([{
+      from_slug: from, to_slug: to, link_type: linkType, context, link_source: src,
+      origin_slug: originSlug, origin_field: originField, from_source_id: fromSrc,
+      to_source_id: toSrc, origin_source_id: originSrc, resolution_type: opts?.resolutionType,
+    }]);
+    await this.withLinkWriteTransaction(async (tx) => {
+      await tx.lockActiveLinkEndpoints(rows, true);
+      const inserted = await executeRawJsonb<{ id: number | string }>(
+        tx,
+        `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, link_kind, origin_page_id, origin_field, resolution_type)
+         SELECT f.id, t.id, v.link_type, v.context, v.link_source, v.link_kind, o.id, v.origin_field, v.resolution_type
+         FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(
+           from_slug text, to_slug text, link_type text, context text, link_source text,
+           origin_slug text, origin_field text, from_source_id text, to_source_id text,
+           origin_source_id text, link_kind text, resolution_type text
+         )
+         JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id AND f.deleted_at IS NULL
+         JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id AND t.deleted_at IS NULL
+         LEFT JOIN pages o ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
+         ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO UPDATE SET
+           context = EXCLUDED.context,
+           origin_field = EXCLUDED.origin_field,
+           resolution_type = EXCLUDED.resolution_type
+         RETURNING id`,
+        [],
+        [{ rows }],
+      );
+      if (inserted.length !== 1) throw new Error('addLink failed: active endpoint identity changed');
+    });
   }
 
   async addLinksBatch(links: LinkBatchInput[], opts?: BatchOpts): Promise<number> {
@@ -2658,24 +2711,27 @@ export class PostgresEngine implements BrainEngine {
     // the same array serializer this fix exists to avoid. Row construction +
     // NUL-stripping + exact defaulting live in buildLinkRows (shared with PGLite).
     const rows = buildLinkRows(links);
-    const result = await executeRawJsonb(
-      this,
-      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, link_kind, origin_page_id, origin_field, resolution_type)
-       SELECT f.id, t.id, v.link_type, v.context, v.link_source, v.link_kind, o.id, v.origin_field, v.resolution_type
-       FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(
-         from_slug text, to_slug text, link_type text, context text, link_source text,
-         origin_slug text, origin_field text, from_source_id text, to_source_id text,
-         origin_source_id text, link_kind text, resolution_type text
-       )
-       JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id
-       JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id
-       LEFT JOIN pages o ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
-       ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO NOTHING
-       RETURNING 1`,
-      [],
-      [{ rows }],
-    );
-    return result.length;
+    return this.withLinkWriteTransaction(async (tx) => {
+      await tx.lockActiveLinkEndpoints(rows, false);
+      const result = await executeRawJsonb(
+        tx,
+        `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, link_kind, origin_page_id, origin_field, resolution_type)
+         SELECT f.id, t.id, v.link_type, v.context, v.link_source, v.link_kind, o.id, v.origin_field, v.resolution_type
+         FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(
+           from_slug text, to_slug text, link_type text, context text, link_source text,
+           origin_slug text, origin_field text, from_source_id text, to_source_id text,
+           origin_source_id text, link_kind text, resolution_type text
+         )
+         JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id AND f.deleted_at IS NULL
+         JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id AND t.deleted_at IS NULL
+         LEFT JOIN pages o ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
+         ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO NOTHING
+         RETURNING 1`,
+        [],
+        [{ rows }],
+      );
+      return result.length;
+    });
   }
 
   async restoreLinkExact(edge: ExactLinkIdentity, opts?: { sourceId?: string }): Promise<void> {
@@ -2684,31 +2740,31 @@ export class PostgresEngine implements BrainEngine {
     if (context !== edge.context) {
       throw new Error('restoreLinkExact failed: context contains unsupported characters');
     }
-    const slugs = [edge.from_slug, edge.to_slug, edge.origin_slug]
-      .filter((value): value is string => value !== null);
-    for (const slug of slugs) {
-      const page = await this.getPage(slug, { sourceId, includeDeleted: true });
-      if (!page) throw new Error(`restoreLinkExact failed: page "${slug}" (source=${sourceId}) not found`);
-    }
-
-    const sql = this.sql;
-    await sql`
-      INSERT INTO links (
-        from_page_id, to_page_id, link_type, context, link_source,
-        origin_page_id, origin_field, resolution_type
-      )
-      SELECT f.id, t.id, ${edge.link_type}, ${context}, ${edge.link_source},
-             o.id, ${edge.origin_field}, ${edge.resolution_type}
-      FROM pages f
-      JOIN pages t ON t.slug = ${edge.to_slug} AND t.source_id = ${sourceId}
-      LEFT JOIN pages o ON o.slug = ${edge.origin_slug} AND o.source_id = ${sourceId}
-      WHERE f.slug = ${edge.from_slug} AND f.source_id = ${sourceId}
-      ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id)
-      DO UPDATE SET
-        context = EXCLUDED.context,
-        origin_field = EXCLUDED.origin_field,
-        resolution_type = EXCLUDED.resolution_type
-    `;
+    const endpoints = [edge.from_slug, edge.to_slug, edge.origin_slug]
+      .filter((value): value is string => value !== null)
+      .map((slug) => ({ source_id: sourceId, slug }));
+    await this.withLinkWriteTransaction(async (tx) => {
+      await tx.lockLinkEndpointsIncludingDeleted(endpoints);
+      const inserted = await tx.sql`
+        INSERT INTO links (
+          from_page_id, to_page_id, link_type, context, link_source,
+          origin_page_id, origin_field, resolution_type
+        )
+        SELECT f.id, t.id, ${edge.link_type}, ${context}, ${edge.link_source},
+               o.id, ${edge.origin_field}, ${edge.resolution_type}
+        FROM pages f
+        JOIN pages t ON t.slug = ${edge.to_slug} AND t.source_id = ${sourceId}
+        LEFT JOIN pages o ON o.slug = ${edge.origin_slug} AND o.source_id = ${sourceId}
+        WHERE f.slug = ${edge.from_slug} AND f.source_id = ${sourceId}
+        ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id)
+        DO UPDATE SET
+          context = EXCLUDED.context,
+          origin_field = EXCLUDED.origin_field,
+          resolution_type = EXCLUDED.resolution_type
+        RETURNING id
+      `;
+      if (inserted.length !== 1) throw new Error('restoreLinkExact failed: endpoint identity changed');
+    });
   }
 
   async removeLink(

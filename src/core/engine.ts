@@ -22,6 +22,9 @@ import type {
   EnrichCandidatesOpts, EnrichCandidate,
 } from './types.ts';
 
+/** Internal marker for engine clones already bound to an open transaction. */
+export const TRANSACTION_SCOPE = Symbol('gbrain.transaction.scope');
+
 /**
  * v0.27.1: file row for binary-asset metadata. Mirrors the `files` table
  * shape on both engines (Postgres has had it since v0.18; PGLite gets it
@@ -1121,7 +1124,9 @@ export interface BrainEngine {
   /**
    * Single-row link insert. linkSource defaults to 'markdown' for back-compat
    * with pre-v0.13 callers. Pass 'frontmatter' + originSlug + originField for
-   * frontmatter-derived edges; 'manual' for user-initiated edges.
+   * frontmatter-derived edges; 'manual' for user-initiated edges. Both
+   * endpoints must be active. Canonical implementations lock them FOR KEY
+   * SHARE so exact zero-inbound soft-delete serializes with this write.
    */
   /**
    * v0.18.0+ multi-source: each endpoint can live in a different source.
@@ -1147,7 +1152,9 @@ export interface BrainEngine {
   /**
    * Bulk insert links via a single multi-row INSERT...SELECT FROM (VALUES) JOIN pages
    * statement with ON CONFLICT DO NOTHING. Returns the count of rows actually inserted
-   * (RETURNING clause excludes conflicts and JOIN-dropped rows whose slugs don't exist).
+   * (RETURNING excludes conflicts and JOIN-dropped rows whose slugs do not
+   * exist or are soft-deleted). Active endpoints are locked in the batch
+   * transaction to serialize with exact zero-inbound soft-delete.
    * Used by extract.ts to avoid 47K sequential round-trips on large brains.
    */
   /**
@@ -1160,7 +1167,11 @@ export interface BrainEngine {
    * Callers MUST NOT wrap externally; see {@link BatchOpts} retry contract.
    */
   addLinksBatch(links: LinkBatchInput[], opts?: BatchOpts): Promise<number>;
-  /** Local-admin rollback primitive. Restores one exact edge without rewriting provenance. */
+  /**
+   * Local-admin rollback primitive. Restores one exact edge without rewriting
+   * provenance. Canonical implementations transactionally lock every endpoint,
+   * including soft-deleted rows, to serialize with exact zero-inbound deletion.
+   */
   restoreLinkExact(edge: ExactLinkIdentity, opts?: { sourceId?: string }): Promise<void>;
   /**
    * Remove links from `from` to `to`. If linkType is provided, only that specific
