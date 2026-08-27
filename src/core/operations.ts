@@ -746,13 +746,6 @@ const get_page: Operation = {
   cliHints: { name: 'get', positional: ['slug'] },
 };
 
-interface ExactPutMergeGate {
-  expectedPreimageContentHash: string;
-  expectedPostimageContentHash: string;
-}
-
-const EXACT_PUT_MERGE_GATE = Symbol('gbrain.exact-put-merge-gate');
-
 const put_page: Operation = {
   name: 'put_page',
   description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
@@ -773,10 +766,6 @@ const put_page: Operation = {
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
-    const exactMerge = (p as unknown as { [EXACT_PUT_MERGE_GATE]?: ExactPutMergeGate })[EXACT_PUT_MERGE_GATE];
-    if (exactMerge && ctx.remote !== false) {
-      throw new OperationError('permission_denied', 'internal exact merge gate requires a trusted local caller');
-    }
 
     // v0.39.3.0 CV6 trust gate for provenance write-through (WARN-8).
     // Only trusted LOCAL callers (ctx.remote === false — capture CLI,
@@ -886,7 +875,6 @@ const put_page: Operation = {
       source_kind: provenanceKind,
       source_uri: provenanceUri,
       ingested_via: provenanceVia,
-      ...(exactMerge ? { exactMerge } : {}),
     });
 
     // v0.39 T13 — auto-prompt on first unknown-type write.
@@ -1209,7 +1197,6 @@ async function exactPageMatches(
   sourceId: string,
   expected: ParsedPage,
   expectedContentHash: string,
-  opts?: { allowAdditionalTags?: boolean; ignoreType?: boolean },
 ): Promise<boolean> {
   const page = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
   if (!page || page.deleted_at || page.source_id !== sourceId || page.content_hash !== expectedContentHash) return false;
@@ -1219,16 +1206,12 @@ async function exactPageMatches(
     [sourceId, slug],
   );
   const expectedAliases = normalizeAliasList(expected.frontmatter.aliases).sort();
-  const expectedTags = [...expected.tags].sort();
-  const tagsMatch = opts?.allowAdditionalTags
-    ? expectedTags.every((tag) => tags.includes(tag))
-    : isDeepStrictEqual(tags, expectedTags);
-  return (opts?.ignoreType === true || page.type === expected.type)
+  return page.type === expected.type
     && page.title === expected.title
     && page.compiled_truth === expected.compiled_truth
     && page.timeline === expected.timeline
     && isDeepStrictEqual(stableImportFrontmatter(page.frontmatter), stableImportFrontmatter(expected.frontmatter))
-    && tagsMatch
+    && isDeepStrictEqual(tags, [...expected.tags].sort())
     && isDeepStrictEqual(aliases.map((row) => row.alias_norm), expectedAliases);
 }
 
@@ -1350,19 +1333,18 @@ const put_page_file_exact: Operation = {
       };
     }
 
-    const putParams: Record<string, unknown> = { slug, content };
-    Object.defineProperty(putParams, EXACT_PUT_MERGE_GATE, {
-      value: {
+    const result = await importFromContent(ctx.engine, slug, content, {
+      noEmbed: true,
+      sourceId,
+      filename: slug.split('/').pop() ?? slug,
+      remote: false,
+      exactMerge: {
         expectedPreimageContentHash: expectedContentHash,
         expectedPostimageContentHash,
-      } satisfies ExactPutMergeGate,
-      enumerable: false,
+      },
     });
-    await put_page.handler(ctx, putParams);
-    if (!(await exactPageMatches(
-      ctx, slug, sourceId, expectedPage, expectedPostimageContentHash,
-      { allowAdditionalTags: true, ignoreType: true },
-    ))) {
+    if (result.status !== 'imported' || !result.parsedPage
+      || !(await exactPageMatches(ctx, slug, sourceId, expectedPage, expectedPostimageContentHash))) {
       throw new OperationError('storage_error', `put_page_file_exact readback mismatch for ${slug}`);
     }
     return { status: 'written', slug, content_hash: expectedPostimageContentHash };

@@ -289,7 +289,7 @@ describe('page_version_retention_exact', () => {
 });
 
 describe('put_page_file_exact', () => {
-  test('is local-only admin, gates stale/mode, and uses canonical ingestion without capture provenance', async () => {
+  test('is local-only admin, gates stale/mode, and bypasses ordinary put_page post-hooks', async () => {
     const op = operationsByName.put_page_file_exact;
     expect(op.localOnly).toBe(true);
     expect(op.scope).toBe('admin');
@@ -301,6 +301,7 @@ describe('put_page_file_exact', () => {
     await engine.putPage('projects/exact-file', {
       type: 'note', title: 'Before', compiled_truth: 'old body', timeline: '', frontmatter: {},
     });
+    await engine.addTag('projects/exact-file', 'stale-enrichment');
     const before = (await engine.getPage('projects/exact-file'))!;
     const baselineCounts = await counts();
     const dir = await mkdtemp(join(tmpdir(), 'gbrain-exact-file-'));
@@ -316,6 +317,8 @@ describe('put_page_file_exact', () => {
       expected_postimage_content_hash: postimageHash,
       file_path: filePath,
     };
+    const ordinaryPutHandler = operationsByName.put_page.handler;
+    let ordinaryPutCalls = 0;
 
     try {
       await writeFile(filePath, content, { mode: 0o600 });
@@ -335,11 +338,22 @@ describe('put_page_file_exact', () => {
       expect(await counts()).toEqual(baselineCounts);
 
       await chmod(filePath, 0o600);
+      operationsByName.put_page.handler = async () => {
+        ordinaryPutCalls += 1;
+        throw new Error('ordinary put_page handler must not run');
+      };
       const result = await op.handler(ctx(), exactParams) as { status: string; slug: string; content_hash: string };
       const after = (await engine.getPage(before.slug))!;
       const afterCounts = await counts();
       const tags = await engine.getTags(before.slug, { sourceId: 'default' });
       const links = await engine.getLinks(before.slug, { sourceId: 'default' });
+      const chunkEmbeddings = await engine.executeRaw<{ embedding_present: boolean }>(
+        `SELECT (cc.embedding IS NOT NULL) AS embedding_present
+           FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+          WHERE p.source_id = $1 AND p.slug = $2`,
+        ['default', before.slug],
+      );
       const provenance = await engine.executeRaw<{
         source_kind: string | null;
         source_uri: string | null;
@@ -355,8 +369,11 @@ describe('put_page_file_exact', () => {
       expect(after.content_hash).toBe(result.content_hash);
       expect(afterCounts.versions).toBe(baselineCounts.versions + 1);
       expect(afterCounts.chunks).toBeGreaterThan(0);
-      expect(tags).toContain('exact-file');
-      expect(links.some((link) => link.to_slug === 'projects/file-target')).toBe(true);
+      expect(tags).toEqual(['exact-file']);
+      expect(links.some((link) => link.to_slug === 'projects/file-target')).toBe(false);
+      expect(chunkEmbeddings.length).toBeGreaterThan(0);
+      expect(chunkEmbeddings.every((row) => row.embedding_present === false)).toBe(true);
+      expect(ordinaryPutCalls).toBe(0);
       expect(await engine.executeRaw(
         `SELECT alias_norm FROM page_aliases WHERE source_id = 'default' AND slug = $1`, [before.slug],
       )).toEqual([{ alias_norm: 'exact file alias' }]);
@@ -366,6 +383,7 @@ describe('put_page_file_exact', () => {
       expect(result).not.toHaveProperty('content');
       expect(result).not.toHaveProperty('file_path');
     } finally {
+      operationsByName.put_page.handler = ordinaryPutHandler;
       await rm(dir, { recursive: true, force: true });
     }
   }, 60_000);

@@ -2,6 +2,19 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.8] - 2026-08-28
+
+### Fixed
+- `put_page_file_exact` now invokes the canonical importer directly with
+  embedding disabled instead of delegating through ordinary `put_page`, so an
+  exact remediation merge cannot trigger repository write-through, auto-link,
+  timeline, facts, chronicle, or post-write lint hooks.
+- Exact merge tags and aliases are projected transactionally and verified with
+  strict page, type, tag, alias, source, and content-hash readback while the
+  locked preimage CAS remains unchanged.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.7] - 2026-08-28
 
 ### Fixed

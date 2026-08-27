@@ -18,9 +18,12 @@ through the local `gbrain call` surface with an explicit source selection.
   `expected_content_sha256` binds the file bytes, and
   `expected_postimage_content_hash` binds the canonical parsed postimage. The
   importer locks and rechecks the preimage inside the write transaction before
-  version, page, tag, alias, or chunk writes. Alias projection is exact and
-  transactional; normal local `put_page` reconciliation hooks still run after
-  commit.
+  version, page, tag, alias, or chunk writes. Tag and alias projection is exact
+  and transactional. This operation calls the canonical importer directly with
+  embedding disabled; it does not run ordinary `put_page` repository
+  write-through, auto-link, timeline, facts, chronicle, or post-write lint
+  hooks. Readback strictly verifies page fields, type, tags, aliases, source,
+  and canonical content hash.
 - `soft_delete_page_exact` binds the mutation to source, slug, and
   `expected_content_hash`. Set `require_zero_inbound=true` to block while any
   database backlink exists. Endpoint row locks serialize this gate with both

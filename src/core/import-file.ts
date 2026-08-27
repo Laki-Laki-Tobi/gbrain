@@ -885,7 +885,7 @@ export async function importFromContent(
       );
     }
 
-    // Tag reconciliation: ADD-ONLY (v0.41.37.0 #1621).
+    // Tag reconciliation: ADD-ONLY for ordinary imports (v0.41.37.0 #1621).
     //
     // We deliberately do NOT delete existing tags here. The `tags` table has
     // no provenance column, and frontmatter tags are stripped from the stored
@@ -903,7 +903,17 @@ export async function importFromContent(
     // are additive metadata) and far preferable to silently losing enrichment
     // tags. Frontmatter-tag REMOVAL would require a `tag_source` provenance
     // column (deferred — see TODOS.md #1621-followup). addTag is idempotent
-    // (ON CONFLICT DO NOTHING), so re-adding existing tags is a no-op.
+    // (ON CONFLICT DO NOTHING), so re-adding existing tags is a no-op. Exact
+    // remediation merges are the deliberate exception: their reviewed
+    // postimage includes the complete tag set, which is projected under the
+    // same transaction and verified by strict readback.
+    if (opts.exactMerge) {
+      const expectedTags = new Set(parsed.tags);
+      const currentTags = await tx.getTags(slug, txOpts);
+      for (const tag of currentTags) {
+        if (!expectedTags.has(tag)) await tx.removeTag(slug, tag, txOpts);
+      }
+    }
     for (const tag of parsed.tags) {
       await tx.addTag(slug, tag, txOpts);
     }
