@@ -1467,6 +1467,8 @@ const list_pages: Operation = {
     type: { type: 'string', description: 'Filter by page type' },
     tag: { type: 'string', description: 'Filter by tag' },
     limit: { type: 'number', description: 'Max results (default 50)' },
+    offset: { type: 'number', description: 'Stable pagination offset (default 0, capped at 1000000)' },
+    include_content_hash: { type: 'boolean', description: 'Include the page content_hash for exact read-only inventories (default false)' },
     // v0.29 — surface filter that already exists on PageFilters.
     updated_after: {
       type: 'string',
@@ -1493,10 +1495,16 @@ const list_pages: Operation = {
     // were ignored at this op handler and the engine returned every source's
     // pages indiscriminately.
     const scope = sourceScopeOpts(ctx);
+    const rawOffset = Number(p.offset ?? 0);
+    const offset = Number.isFinite(rawOffset)
+      ? Math.min(1_000_000, Math.max(0, Math.trunc(rawOffset)))
+      : 0;
+    const includeContentHash = (p.include_content_hash as boolean) === true;
     const pages = await ctx.engine.listPages({
       type: p.type as any,
       tag: p.tag as string,
       limit: clampSearchLimit(p.limit as number | undefined, 50, 100),
+      offset,
       includeDeleted: (p.include_deleted as boolean) === true,
       updated_after: typeof p.updated_after === 'string' ? p.updated_after : undefined,
       sort,
@@ -1508,6 +1516,7 @@ const list_pages: Operation = {
       title: pg.title,
       updated_at: pg.updated_at,
       ...(pg.deleted_at ? { deleted_at: pg.deleted_at } : {}),
+      ...(includeContentHash ? { content_hash: pg.content_hash } : {}),
     }));
   },
   scope: 'read',

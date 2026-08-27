@@ -134,6 +134,8 @@ describe('v0.29 — subagent allow-list', () => {
     const op = operationsByName['list_pages'];
     expect(op.params.sort).toBeDefined();
     expect(op.params.updated_after).toBeDefined();
+    expect(op.params.offset).toBeDefined();
+    expect(op.params.include_content_hash).toBeDefined();
   });
 });
 
