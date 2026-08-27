@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import { chmod, mkdtemp, readFile, rm, stat, symlink, truncate, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { appendFile, chmod, mkdtemp, readFile, rm, stat, symlink, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -387,4 +388,346 @@ describe('put_page_file_exact', () => {
       await rm(dir, { recursive: true, force: true });
     }
   }, 60_000);
+});
+
+describe('exact corpus page operations', () => {
+  test('reject every remediation operation remotely before touching the engine', async () => {
+    const explodingEngine = new Proxy({} as PGLiteEngine, {
+      get() { throw new Error('engine must not be touched'); },
+    });
+    const remote = { ...ctx(), engine: explodingEngine, remote: true };
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ['create_page_file_exact', { slug: 'projects/new', expected_content_sha256: 'a'.repeat(64), file_path: '/tmp/nope' }],
+      ['soft_delete_page_exact', { slug: 'projects/old', expected_content_hash: 'a'.repeat(64) }],
+      ['restore_page_exact', { slug: 'projects/old', expected_content_hash: 'a'.repeat(64), expected_deleted_at: new Date().toISOString() }],
+      ['purge_pages_exact', { action: 'plan', run_id: 'remote-test', allowlist: [] }],
+    ];
+    for (const [name, params] of cases) {
+      const op = operationsByName[name];
+      expect(op.localOnly).toBe(true);
+      expect(op.scope).toBe('admin');
+      expect(op.mutating).toBe(true);
+      await expect(op.handler(remote, params)).rejects.toThrow('local-only');
+    }
+  });
+
+  test('creates an absent lowercase page from an exact private file and recovers only with an explicit ambiguity gate', async () => {
+    const op = operationsByName.create_page_file_exact;
+    const dir = await mkdtemp(join(tmpdir(), 'gbrain-create-exact-'));
+    const filePath = join(dir, 'summary.md');
+    const content = '---\ntype: note\ntitle: Exact summary\ntags:\n  - governance\n---\n\n# Exact summary\n\nBounded semantic content.\n';
+    const fileSha = createHash('sha256').update(content).digest('hex');
+    try {
+      await writeFile(filePath, content, { mode: 0o600 });
+      await expect(op.handler(ctx(), {
+        slug: 'Projects/New-Summary', expected_content_sha256: fileSha, file_path: filePath,
+      })).rejects.toThrow('lowercase');
+      await expect(op.handler(ctx(), {
+        slug: 'projects/new-summary', expected_content_sha256: '0'.repeat(64), file_path: filePath,
+      })).rejects.toThrow('file sha256 changed');
+
+      const created = await op.handler(ctx(), {
+        slug: 'projects/new-summary', expected_content_sha256: fileSha, file_path: filePath,
+      }) as any;
+      expect(created.status).toBe('created');
+      expect(created.recovered_after_ambiguous_commit).toBe(false);
+      const page = await engine.getPage('projects/new-summary', { sourceId: 'default' });
+      expect(page?.title).toBe('Exact summary');
+      expect(page?.compiled_truth).toContain('Bounded semantic content.');
+      expect(await engine.getTags('projects/new-summary', { sourceId: 'default' })).toContain('governance');
+
+      await expect(op.handler(ctx(), {
+        slug: 'projects/new-summary', expected_content_sha256: fileSha, file_path: filePath,
+      })).rejects.toThrow('absence gate failed');
+      const recovered = await op.handler(ctx(), {
+        slug: 'projects/new-summary', expected_content_sha256: fileSha, file_path: filePath,
+        accept_ambiguous_commit: true,
+      }) as any;
+      expect(recovered.recovered_after_ambiguous_commit).toBe(true);
+
+      await engine.executeRaw(
+        `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+        ['other-source'],
+      );
+      const otherCtx = { ...ctx(), sourceId: 'other-source' };
+      const other = await op.handler(otherCtx, {
+        slug: 'projects/new-summary', expected_content_sha256: fileSha, file_path: filePath,
+      }) as any;
+      expect(other.status).toBe('created');
+      expect((await engine.getPage('projects/new-summary', { sourceId: 'other-source' }))?.source_id).toBe('other-source');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('soft-delete gates hash and inbound links, then restore gates the exact deleted identity', async () => {
+    await engine.putPage('projects/exact-delete', {
+      type: 'note', title: 'Delete me', compiled_truth: 'exact body', timeline: '', frontmatter: {},
+    });
+    await engine.putPage('projects/referrer', {
+      type: 'note', title: 'Referrer', compiled_truth: 'referrer', timeline: '', frontmatter: {},
+    });
+    await engine.addLink('projects/referrer', 'projects/exact-delete', 'context', 'related', 'manual');
+    const before = (await engine.getPage('projects/exact-delete'))!;
+
+    const soft = operationsByName.soft_delete_page_exact;
+    await expect(soft.handler(ctx(), {
+      slug: before.slug, expected_content_hash: '0'.repeat(64), require_zero_inbound: true,
+    })).rejects.toThrow('content hash changed');
+    await expect(soft.handler(ctx(), {
+      slug: before.slug, expected_content_hash: before.content_hash, require_zero_inbound: true,
+    })).rejects.toThrow('zero-inbound gate failed');
+    await engine.executeRaw(`DELETE FROM links WHERE to_page_id = $1::int`, [before.id]);
+
+    const deleted = await soft.handler(ctx(), {
+      slug: before.slug, expected_content_hash: before.content_hash, require_zero_inbound: true,
+    }) as any;
+    expect(deleted.status).toBe('soft_deleted');
+    expect((await engine.getPage(before.slug))).toBeNull();
+    const tombstone = (await engine.getPage(before.slug, { includeDeleted: true }))!;
+    expect(tombstone.deleted_at).toBeTruthy();
+    expect((await soft.handler(ctx(), {
+      slug: before.slug, expected_content_hash: before.content_hash, require_zero_inbound: true,
+    }) as any).status).toBe('already_soft_deleted');
+
+    const restore = operationsByName.restore_page_exact;
+    await expect(restore.handler(ctx(), {
+      slug: before.slug, expected_content_hash: before.content_hash,
+      expected_deleted_at: new Date(tombstone.deleted_at!.getTime() + 1000).toISOString(),
+    })).rejects.toThrow('deleted identity changed');
+    const restored = await restore.handler(ctx(), {
+      slug: before.slug, expected_content_hash: before.content_hash,
+      expected_deleted_at: tombstone.deleted_at!.toISOString(),
+    }) as any;
+    expect(restored.status).toBe('restored');
+    expect((await engine.getPage(before.slug))?.content_hash).toBe(before.content_hash);
+    await expect(restore.handler(ctx(), {
+      slug: before.slug, expected_content_hash: before.content_hash,
+      expected_deleted_at: tombstone.deleted_at!.toISOString(),
+    })).rejects.toThrow('already active');
+    expect((await restore.handler(ctx(), {
+      slug: before.slug, expected_content_hash: before.content_hash,
+      expected_deleted_at: tombstone.deleted_at!.toISOString(), accept_ambiguous_commit: true,
+    }) as any).recovered_after_ambiguous_commit).toBe(true);
+  });
+});
+
+describe('purge_pages_exact', () => {
+  async function seedPurgePage(slug: string, body: string, daysAgo: number): Promise<any> {
+    await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: body, timeline: '', frontmatter: {} });
+    const page = (await engine.getPage(slug))!;
+    await engine.addTag(slug, 'purge-test', { sourceId: 'default' });
+    await engine.upsertChunks(slug, [{ chunk_index: 0, chunk_text: body, chunk_source: 'compiled_truth' }], { sourceId: 'default' });
+    await engine.createVersion(slug, { sourceId: 'default' });
+    await engine.softDeletePage(slug, { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages SET deleted_at = now() - ($1::int * interval '1 day') WHERE id = $2::int`,
+      [daysAgo, page.id],
+    );
+    return (await engine.getPage(slug, { sourceId: 'default', includeDeleted: true }))!;
+  }
+
+  function entry(page: any): Record<string, string> {
+    return { slug: page.slug, deleted_at: page.deleted_at.toISOString(), content_hash: page.content_hash };
+  }
+
+  test('rejects an empty or over-100 allowlist before any purge plan can be created', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const timestamp = new Date().toISOString();
+    await expect(op.handler(ctx(), {
+      action: 'plan', run_id: 'empty-allowlist', allowlist: [],
+    })).rejects.toThrow('between 1 and 100');
+    await expect(op.handler(ctx(), {
+      action: 'plan', run_id: 'large-allowlist',
+      allowlist: Array.from({ length: 101 }, (_, index) => ({
+        slug: `archive/page-${index}`,
+        deleted_at: timestamp,
+        content_hash: 'a'.repeat(64),
+      })),
+    })).rejects.toThrow('between 1 and 100');
+  });
+
+  test('plans, purges, verifies, and restores a bounded exact graph from a private backup', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const first = await seedPurgePage('archive/purge-one', 'private purge body one', 10);
+    const second = await seedPurgePage('archive/purge-two', 'private purge body two', 11);
+    await engine.putPage('projects/purge-referrer', {
+      type: 'note', title: 'Referrer', compiled_truth: 'active', timeline: '', frontmatter: {},
+    });
+    await engine.addLink('projects/purge-referrer', first.slug, 'delete with target', 'related', 'manual');
+    const referrer = (await engine.getPage('projects/purge-referrer'))!;
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
+       VALUES ($1::int, $1::int, 'origin-only', 'origin only', 'frontmatter', $2::int, 'related')`,
+      [referrer.id, second.id],
+    );
+    await engine.executeRaw(
+      `INSERT INTO page_aliases (source_id, alias_norm, slug) VALUES ('default', 'purge one alias', $1)`,
+      [first.slug],
+    );
+    await engine.executeRaw(
+      `INSERT INTO files (source_id, page_slug, page_id, filename, storage_path, content_hash, metadata)
+       VALUES ('default', $1, $2::int, 'purge.txt', 'purge-test/roundtrip.txt', $3, '{}'::jsonb)`,
+      [first.slug, first.id, 'f'.repeat(64)],
+    );
+    await engine.executeRaw(
+      `INSERT INTO takes (page_id, row_num, claim, kind, holder, weight)
+       VALUES ($1::int, 0, 'bounded evidence', 'fact', 'world', 0.5)`,
+      [first.id],
+    );
+    await engine.executeRaw(
+      `INSERT INTO synthesis_evidence (synthesis_page_id, take_page_id, take_row_num, citation_index)
+       VALUES ($1::int, $2::int, 0, 0)`,
+      [referrer.id, first.id],
+    );
+
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-purge-exact-home-'));
+    const params = {
+      action: 'plan', run_id: 'purge-roundtrip', allowlist: [entry(first), entry(second)],
+    };
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        const plan = await op.handler(ctx(), params) as any;
+        expect(plan.status).toBe('pass');
+        expect(plan.candidate_count).toBe(2);
+        expect(plan).not.toHaveProperty('page_ids');
+        expect(JSON.stringify(plan)).not.toContain('private purge body');
+        const dir = join(home, 'governance-backups', 'page-purge-exact', 'purge-roundtrip');
+        expect((await stat(join(dir, 'plan.json'))).mode & 0o777).toBe(0o600);
+        expect((await stat(join(dir, 'backup.json.gz'))).mode & 0o777).toBe(0o600);
+
+        await expect(op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint,
+        })).rejects.toThrow('apply_enabled=true');
+        const applied = await op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        }) as any;
+        expect(applied.status).toBe('pass');
+        expect(applied.purged_count).toBe(2);
+        expect(await engine.getPage(first.slug, { includeDeleted: true })).toBeNull();
+        expect((await op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        }) as any).purged_count).toBe(2);
+
+        const verified = await op.handler(ctx(), { ...params, action: 'verify' }) as any;
+        expect(verified.status).toBe('pass');
+        expect(verified.verified_absent_count).toBe(2);
+        expect((await engine.executeRaw(`SELECT count(*)::int AS count FROM page_aliases WHERE slug = $1`, [first.slug]))[0].count).toBe(0);
+        expect((await engine.executeRaw(`SELECT page_id FROM files WHERE storage_path = 'purge-test/roundtrip.txt'`))[0].page_id).toBeNull();
+        expect((await engine.executeRaw(`SELECT count(*)::int AS count FROM synthesis_evidence`))[0].count).toBe(0);
+
+        const rolledBack = await op.handler(ctx(), {
+          ...params, action: 'rollback', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        }) as any;
+        expect(rolledBack.status).toBe('pass');
+        expect(rolledBack.restored_count).toBe(2);
+        const restored = await engine.getPage(first.slug, { includeDeleted: true });
+        expect(restored?.content_hash).toBe(first.content_hash);
+        expect(restored?.deleted_at?.toISOString()).toBe(first.deleted_at.toISOString());
+        expect(await engine.getTags(first.slug, { sourceId: 'default' })).toContain('purge-test');
+        expect((await engine.getChunks(first.slug, { sourceId: 'default' })).length).toBe(1);
+        expect((await engine.getLinks('projects/purge-referrer', { includeDeleted: true })).some((link) => link.to_slug === first.slug)).toBe(true);
+        expect((await engine.executeRaw(`SELECT count(*)::int AS count FROM page_aliases WHERE slug = $1`, [first.slug]))[0].count).toBe(1);
+        expect(Number((await engine.executeRaw(`SELECT page_id FROM files WHERE storage_path = 'purge-test/roundtrip.txt'`))[0].page_id)).toBe(first.id);
+        expect((await engine.executeRaw(`SELECT count(*)::int AS count FROM synthesis_evidence`))[0].count).toBe(1);
+        expect(Number((await engine.executeRaw(`SELECT origin_page_id FROM links WHERE link_type = 'origin-only'`))[0].origin_page_id)).toBe(second.id);
+        expect((await op.handler(ctx(), {
+          ...params, action: 'rollback', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        }) as any).restored_count).toBe(2);
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('rejects stale hashes at plan time and source identity drift before apply', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const page = await seedPurgePage('archive/source-drift', 'source drift', 10);
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-purge-source-drift-home-'));
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        await expect(op.handler(ctx(), {
+          action: 'plan', run_id: 'hash-drift',
+          allowlist: [{ ...entry(page), content_hash: '0'.repeat(64) }],
+        })).rejects.toThrow('content hash drift');
+
+        const params = { action: 'plan', run_id: 'source-drift', allowlist: [entry(page)] };
+        const plan = await op.handler(ctx(), params) as any;
+        await engine.executeRaw(
+          `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+          ['drift-source'],
+        );
+        await engine.executeRaw(`UPDATE pages SET source_id = 'drift-source' WHERE id = $1::int`, [page.id]);
+        await expect(op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        })).rejects.toThrow('source identity drift');
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test('fails closed on source/hash/partial drift and requires a gate for an artifact-less committed state', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const first = await seedPurgePage('archive/drift-one', 'drift one', 10);
+    const second = await seedPurgePage('archive/drift-two', 'drift two', 10);
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-purge-drift-home-'));
+    const params = { action: 'plan', run_id: 'purge-drift', allowlist: [entry(first), entry(second)] };
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        const plan = await op.handler(ctx(), params) as any;
+        await engine.executeRaw('DELETE FROM pages WHERE id = $1::int', [first.id]);
+        await expect(op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        })).rejects.toThrow('partially absent');
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+
+    const ambiguous = await seedPurgePage('archive/ambiguous', 'ambiguous', 10);
+    const ambiguousHome = await mkdtemp(join(tmpdir(), 'gbrain-purge-ambiguous-home-'));
+    const ambiguousParams = { action: 'plan', run_id: 'purge-ambiguous', allowlist: [entry(ambiguous)] };
+    try {
+      await withEnv({ GBRAIN_HOME: ambiguousHome }, async () => {
+        const plan = await op.handler(ctx(), ambiguousParams) as any;
+        await engine.executeRaw('DELETE FROM pages WHERE id = $1::int', [ambiguous.id]);
+        await expect(op.handler(ctx(), {
+          ...ambiguousParams, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        })).rejects.toThrow('accept_ambiguous_commit=true');
+        const recovered = await op.handler(ctx(), {
+          ...ambiguousParams, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint,
+          apply_enabled: true, accept_ambiguous_commit: true,
+        }) as any;
+        expect(recovered.recovered_after_ambiguous_commit).toBe(true);
+        const rollback = await op.handler(ctx(), {
+          ...ambiguousParams, action: 'rollback', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        }) as any;
+        expect(rollback.status).toBe('pass');
+      });
+    } finally {
+      await rm(ambiguousHome, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('rejects a backup whose bytes changed even when its private mode is preserved', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const page = await seedPurgePage('archive/backup-integrity', 'backup integrity', 10);
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-purge-integrity-home-'));
+    const params = { action: 'plan', run_id: 'purge-integrity', allowlist: [entry(page)] };
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        const plan = await op.handler(ctx(), params) as any;
+        const backup = join(home, 'governance-backups', 'page-purge-exact', 'purge-integrity', 'backup.json.gz');
+        await appendFile(backup, Buffer.from([0]));
+        await chmod(backup, 0o600);
+        await expect(op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        })).rejects.toThrow('integrity mismatch');
+        expect(await engine.getPage(page.slug, { includeDeleted: true })).not.toBeNull();
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
 });

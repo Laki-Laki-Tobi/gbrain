@@ -4,6 +4,7 @@
  */
 
 import { constants, lstatSync, realpathSync } from 'fs';
+import { createHash } from 'node:crypto';
 import { lstat, open } from 'node:fs/promises';
 import { isAbsolute, resolve, relative, sep } from 'path';
 import { isDeepStrictEqual } from 'node:util';
@@ -11,7 +12,13 @@ import type { BrainEngine, ExactLinkIdentity } from './engine.ts';
 import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
-import { importFromContent } from './import-file.ts';
+import {
+  computeImportContentHash,
+  importFromContent,
+  stableImportFrontmatter,
+  type ParsedPage,
+} from './import-file.ts';
+import { parseMarkdown } from './markdown.ts';
 import { writePageThrough } from './write-through.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
@@ -31,6 +38,7 @@ import { CJK_SLUG_CHARS } from './cjk.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
 import { runPageVersionRetention } from './page-version-retention.ts';
+import { runPurgePagesExact, type PurgeAllowlistEntry } from './exact-corpus-remediation.ts';
 import {
   GET_RECENT_SALIENCE_DESCRIPTION,
   FIND_ANOMALIES_DESCRIPTION,
@@ -1116,6 +1124,156 @@ const put_page: Operation = {
 
 const PUT_PAGE_FILE_EXACT_MAX_BYTES = 16 * 1024 * 1024;
 
+async function readPrivateExactFile(filePath: string): Promise<{ content: string; sha256: string }> {
+  if (!isAbsolute(filePath)) {
+    throw new OperationError('invalid_params', 'file_path must be absolute');
+  }
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    const pathStat = await lstat(filePath);
+    if (!pathStat.isFile()) {
+      throw new OperationError('invalid_params', 'file_path must reference a regular file');
+    }
+    handle = await open(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const fileStat = await handle.stat();
+    if (!fileStat.isFile()) {
+      throw new OperationError('invalid_params', 'file_path must reference a regular file');
+    }
+    if ((fileStat.mode & 0o7777) !== 0o600) {
+      throw new OperationError('invalid_params', 'file mode must be exactly 0600');
+    }
+    if (fileStat.size > PUT_PAGE_FILE_EXACT_MAX_BYTES) {
+      throw new OperationError('invalid_params', 'file exceeds the 16 MiB size limit');
+    }
+    const bytes = await handle.readFile();
+    if (bytes.byteLength > PUT_PAGE_FILE_EXACT_MAX_BYTES) {
+      throw new OperationError('invalid_params', 'file exceeds the 16 MiB size limit');
+    }
+    if (bytes.includes(0)) {
+      throw new OperationError('invalid_params', 'file must be UTF-8 text without NUL bytes');
+    }
+    let content: string;
+    try {
+      content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch {
+      throw new OperationError('invalid_params', 'file must contain valid UTF-8 text');
+    }
+    return { content, sha256: createHash('sha256').update(bytes).digest('hex') };
+  } catch (error) {
+    if (error instanceof OperationError) throw error;
+    throw new OperationError('invalid_params', 'file_path could not be opened or validated');
+  } finally {
+    await handle?.close();
+  }
+}
+
+function requireLowercaseExactSlug(value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new OperationError('invalid_params', 'slug must be provided explicitly as a string');
+  }
+  validatePageSlug(value);
+  if (value !== value.toLowerCase()) {
+    throw new OperationError('invalid_params', 'slug must be lowercase');
+  }
+  return value;
+}
+
+function parsedPageFromContent(content: string, slug: string): ParsedPage {
+  const parsed = parseMarkdown(content, `${slug}.md`);
+  return {
+    type: parsed.type,
+    title: parsed.title,
+    compiled_truth: parsed.compiled_truth,
+    timeline: parsed.timeline || '',
+    frontmatter: parsed.frontmatter,
+    tags: parsed.tags,
+  };
+}
+
+async function exactPageMatches(
+  ctx: OperationContext,
+  slug: string,
+  sourceId: string,
+  expected: ParsedPage,
+  expectedContentHash: string,
+): Promise<boolean> {
+  const page = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
+  if (!page || page.deleted_at || page.source_id !== sourceId || page.content_hash !== expectedContentHash) return false;
+  const tags = (await ctx.engine.getTags(slug, { sourceId })).sort();
+  return page.type === expected.type
+    && page.title === expected.title
+    && page.compiled_truth === expected.compiled_truth
+    && page.timeline === expected.timeline
+    && isDeepStrictEqual(stableImportFrontmatter(page.frontmatter), stableImportFrontmatter(expected.frontmatter))
+    && isDeepStrictEqual(tags, [...expected.tags].sort());
+}
+
+const create_page_file_exact: Operation = {
+  name: 'create_page_file_exact',
+  description: 'Local-admin source-scoped creation of an absent lowercase page from a private sha256-gated file.',
+  params: {
+    slug: { type: 'string', required: true },
+    expected_content_sha256: { type: 'string', required: true },
+    file_path: { type: 'string', required: true },
+    accept_ambiguous_commit: { type: 'boolean' },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError('permission_denied', 'create_page_file_exact is local-only and must be called through the local CLI.');
+    }
+    const slug = requireLowercaseExactSlug(p.slug);
+    const expectedFileSha256 = requireExactString(p, 'expected_content_sha256');
+    if (!/^[a-f0-9]{64}$/.test(expectedFileSha256)) {
+      throw new OperationError('invalid_params', 'expected_content_sha256 must be lowercase sha256 hex');
+    }
+    const filePath = requireExactString(p, 'file_path');
+    const { content, sha256: fileSha256 } = await readPrivateExactFile(filePath);
+    if (fileSha256 !== expectedFileSha256) {
+      throw new OperationError('storage_error', `create_page_file_exact drift: file sha256 changed for "${slug}"`);
+    }
+    const sourceId = ctx.sourceId || 'default';
+    const expectedPage = parsedPageFromContent(content, slug);
+    const expectedContentHash = computeImportContentHash(expectedPage);
+    const current = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
+    if (current) {
+      if (p.accept_ambiguous_commit === true
+        && await exactPageMatches(ctx, slug, sourceId, expectedPage, expectedContentHash)) {
+        return { status: 'created', slug, content_hash: expectedContentHash, recovered_after_ambiguous_commit: true };
+      }
+      throw new OperationError('storage_error', `create_page_file_exact absence gate failed for "${slug}"`);
+    }
+    if (ctx.dryRun) {
+      return { dry_run: true, action: 'create_page_file_exact', slug, content_sha256: fileSha256 };
+    }
+
+    let result;
+    try {
+      result = await importFromContent(ctx.engine, slug, content, {
+        noEmbed: true,
+        sourceId,
+        filename: slug.split('/').pop() ?? slug,
+        remote: false,
+      });
+    } catch (error) {
+      if (await exactPageMatches(ctx, slug, sourceId, expectedPage, expectedContentHash)) {
+        if (p.accept_ambiguous_commit !== true) {
+          throw new OperationError('storage_error', 'ambiguous create commit requires accept_ambiguous_commit=true after operator review');
+        }
+        return { status: 'created', slug, content_hash: expectedContentHash, recovered_after_ambiguous_commit: true };
+      }
+      throw error;
+    }
+    if (result.status !== 'imported' || !result.parsedPage
+      || !(await exactPageMatches(ctx, slug, sourceId, result.parsedPage, expectedContentHash))) {
+      throw new OperationError('storage_error', `create_page_file_exact readback mismatch for ${slug}`);
+    }
+    return { status: 'created', slug, content_hash: expectedContentHash, recovered_after_ambiguous_commit: false };
+  },
+};
+
 const put_page_file_exact: Operation = {
   name: 'put_page_file_exact',
   description: 'Local-admin hash-gated canonical page ingestion from a private local UTF-8 file.',
@@ -1137,46 +1295,7 @@ const put_page_file_exact: Operation = {
     const slug = requireExactString(p, 'slug');
     const expectedContentHash = requireExactString(p, 'expected_content_hash');
     const filePath = requireExactString(p, 'file_path');
-    if (!isAbsolute(filePath)) {
-      throw new OperationError('invalid_params', 'file_path must be absolute');
-    }
-
-    let content: string;
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      const pathStat = await lstat(filePath);
-      if (!pathStat.isFile()) {
-        throw new OperationError('invalid_params', 'file_path must reference a regular file');
-      }
-      handle = await open(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-      const fileStat = await handle.stat();
-      if (!fileStat.isFile()) {
-        throw new OperationError('invalid_params', 'file_path must reference a regular file');
-      }
-      if ((fileStat.mode & 0o7777) !== 0o600) {
-        throw new OperationError('invalid_params', 'file mode must be exactly 0600');
-      }
-      if (fileStat.size > PUT_PAGE_FILE_EXACT_MAX_BYTES) {
-        throw new OperationError('invalid_params', 'file exceeds the 16 MiB size limit');
-      }
-      const bytes = await handle.readFile();
-      if (bytes.byteLength > PUT_PAGE_FILE_EXACT_MAX_BYTES) {
-        throw new OperationError('invalid_params', 'file exceeds the 16 MiB size limit');
-      }
-      if (bytes.includes(0)) {
-        throw new OperationError('invalid_params', 'file must be UTF-8 text without NUL bytes');
-      }
-      try {
-        content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-      } catch {
-        throw new OperationError('invalid_params', 'file must contain valid UTF-8 text');
-      }
-    } catch (error) {
-      if (error instanceof OperationError) throw error;
-      throw new OperationError('invalid_params', 'file_path could not be opened or validated');
-    } finally {
-      await handle?.close();
-    }
+    const { content } = await readPrivateExactFile(filePath);
 
     const sourceId = ctx.sourceId || 'default';
     const current = await ctx.engine.getPage(slug, { sourceId });
@@ -1379,6 +1498,155 @@ async function runAutoLink(
 
   return { ...result, unresolved };
 }
+
+const soft_delete_page_exact: Operation = {
+  name: 'soft_delete_page_exact',
+  description: 'Local-admin source/hash-gated soft-delete with optional exact zero-inbound enforcement and include-deleted readback.',
+  params: {
+    slug: { type: 'string', required: true },
+    expected_content_hash: { type: 'string', required: true },
+    require_zero_inbound: { type: 'boolean' },
+    accept_ambiguous_commit: { type: 'boolean' },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError('permission_denied', 'soft_delete_page_exact is local-only and must be called through the local CLI.');
+    }
+    const slug = requireLowercaseExactSlug(p.slug);
+    const expectedContentHash = requireExactString(p, 'expected_content_hash');
+    if (!/^[a-f0-9]{64}$/.test(expectedContentHash)) {
+      throw new OperationError('invalid_params', 'expected_content_hash must be lowercase sha256 hex');
+    }
+    const sourceId = ctx.sourceId || 'default';
+    const before = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
+    if (!before) throw new OperationError('page_not_found', `Page not found in source ${sourceId}: ${slug}`);
+    if (before.source_id !== sourceId) throw new OperationError('storage_error', `source identity drift for "${slug}"`);
+    if (before.content_hash !== expectedContentHash) {
+      throw new OperationError('storage_error', `soft_delete_page_exact drift: content hash changed for "${slug}"`);
+    }
+    if (before.deleted_at) {
+      return { status: 'already_soft_deleted', slug, content_hash: expectedContentHash, deleted_at: before.deleted_at };
+    }
+    if (ctx.dryRun) {
+      return { dry_run: true, action: 'soft_delete_page_exact', slug, require_zero_inbound: p.require_zero_inbound === true };
+    }
+
+    try {
+      await ctx.engine.transaction(async (tx) => {
+        if (p.require_zero_inbound === true) {
+          const [row] = await tx.executeRaw<{ inbound_count: number | string }>(
+            `SELECT count(*)::bigint AS inbound_count FROM links WHERE to_page_id = $1::int`,
+            [before.id],
+          );
+          if (Number(row?.inbound_count || 0) !== 0) {
+            throw new Error(`soft_delete_page_exact zero-inbound gate failed for "${slug}"`);
+          }
+        }
+        const changed = await tx.executeRaw<{ deleted_at: Date | string }>(`
+          UPDATE pages SET deleted_at = now()
+           WHERE id = $1::int AND source_id = $2 AND slug = $3
+             AND content_hash = $4 AND deleted_at IS NULL
+           RETURNING deleted_at
+        `, [before.id, sourceId, slug, expectedContentHash]);
+        if (changed.length !== 1) throw new Error(`soft-delete identity changed for ${slug}`);
+      });
+    } catch (error) {
+      const afterError = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
+      if (afterError?.deleted_at && afterError.content_hash === expectedContentHash) {
+        if (p.accept_ambiguous_commit !== true) {
+          throw new OperationError('storage_error', 'ambiguous soft-delete commit requires accept_ambiguous_commit=true after operator review');
+        }
+        return {
+          status: 'soft_deleted', slug, content_hash: expectedContentHash,
+          deleted_at: afterError.deleted_at, recovered_after_ambiguous_commit: true,
+        };
+      }
+      throw error;
+    }
+    const readback = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
+    if (!readback?.deleted_at || readback.source_id !== sourceId || readback.content_hash !== expectedContentHash) {
+      throw new OperationError('storage_error', `soft_delete_page_exact readback mismatch for ${slug}`);
+    }
+    return {
+      status: 'soft_deleted', slug, content_hash: expectedContentHash,
+      deleted_at: readback.deleted_at, recovered_after_ambiguous_commit: false,
+    };
+  },
+};
+
+const restore_page_exact: Operation = {
+  name: 'restore_page_exact',
+  description: 'Local-admin restore bound to exact source, slug, deleted_at, and content hash with active readback.',
+  params: {
+    slug: { type: 'string', required: true },
+    expected_content_hash: { type: 'string', required: true },
+    expected_deleted_at: { type: 'string', required: true },
+    accept_ambiguous_commit: { type: 'boolean' },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError('permission_denied', 'restore_page_exact is local-only and must be called through the local CLI.');
+    }
+    const slug = requireLowercaseExactSlug(p.slug);
+    const expectedContentHash = requireExactString(p, 'expected_content_hash');
+    if (!/^[a-f0-9]{64}$/.test(expectedContentHash)) {
+      throw new OperationError('invalid_params', 'expected_content_hash must be lowercase sha256 hex');
+    }
+    const rawDeletedAt = requireExactString(p, 'expected_deleted_at');
+    const parsedDeletedAt = Date.parse(rawDeletedAt);
+    if (!Number.isFinite(parsedDeletedAt)) throw new OperationError('invalid_params', 'expected_deleted_at must be an ISO timestamp');
+    const expectedDeletedAt = new Date(parsedDeletedAt).toISOString();
+    const sourceId = ctx.sourceId || 'default';
+    const before = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
+    if (!before) throw new OperationError('page_not_found', `Page not found in source ${sourceId}: ${slug}`);
+    if (before.source_id !== sourceId) throw new OperationError('storage_error', `source identity drift for "${slug}"`);
+    if (before.content_hash !== expectedContentHash) {
+      throw new OperationError('storage_error', `restore_page_exact drift: content hash changed for "${slug}"`);
+    }
+    if (!before.deleted_at) {
+      if (p.accept_ambiguous_commit === true) {
+        return { status: 'restored', slug, content_hash: expectedContentHash, recovered_after_ambiguous_commit: true };
+      }
+      throw new OperationError('storage_error', 'page is already active; accept_ambiguous_commit=true is required for reviewed recovery');
+    }
+    if (before.deleted_at.toISOString() !== expectedDeletedAt) {
+      throw new OperationError('storage_error', `restore_page_exact drift: deleted identity changed for "${slug}"`);
+    }
+    if (ctx.dryRun) return { dry_run: true, action: 'restore_page_exact', slug, expected_deleted_at: expectedDeletedAt };
+
+    try {
+      await ctx.engine.transaction(async (tx) => {
+        const changed = await tx.executeRaw<{ id: number | string }>(`
+          UPDATE pages SET deleted_at = NULL
+           WHERE id = $1::int AND source_id = $2 AND slug = $3
+             AND content_hash = $4 AND deleted_at = $5::timestamptz
+           RETURNING id
+        `, [before.id, sourceId, slug, expectedContentHash, expectedDeletedAt]);
+        if (changed.length !== 1) throw new Error(`restore identity changed for ${slug}`);
+      });
+    } catch (error) {
+      const afterError = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
+      if (afterError && !afterError.deleted_at && afterError.content_hash === expectedContentHash) {
+        if (p.accept_ambiguous_commit !== true) {
+          throw new OperationError('storage_error', 'ambiguous restore commit requires accept_ambiguous_commit=true after operator review');
+        }
+        return { status: 'restored', slug, content_hash: expectedContentHash, recovered_after_ambiguous_commit: true };
+      }
+      throw error;
+    }
+    const readback = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
+    if (!readback || readback.deleted_at || readback.source_id !== sourceId || readback.content_hash !== expectedContentHash) {
+      throw new OperationError('storage_error', `restore_page_exact readback mismatch for ${slug}`);
+    }
+    return { status: 'restored', slug, content_hash: expectedContentHash, recovered_after_ambiguous_commit: false };
+  },
+};
 
 const delete_page: Operation = {
   name: 'delete_page',
@@ -2397,6 +2665,63 @@ const page_version_retention_exact: Operation = {
         keepLatest: integer('keep_latest', 3, 2, 100),
         deleteLimit: integer('delete_limit', 1000, 0, 5000),
         maxPayloadBytes: integer('max_payload_bytes', 64 * 1024 * 1024, 1024 * 1024, 256 * 1024 * 1024),
+        expectedFingerprint: typeof p.expected_fingerprint === 'string' ? p.expected_fingerprint : undefined,
+        applyEnabled: p.apply_enabled === true,
+        acceptAmbiguousCommit: p.accept_ambiguous_commit === true,
+      });
+    } catch (error) {
+      throw new OperationError('storage_error', error instanceof Error ? error.message : String(error));
+    }
+  },
+};
+
+const purge_pages_exact: Operation = {
+  name: 'purge_pages_exact',
+  description: 'Local-admin bounded exact hard purge (max 100) with source/deleted/hash allowlist, private graph backup, verify, and rollback.',
+  params: {
+    action: { type: 'string', required: true, enum: ['plan', 'apply', 'verify', 'rollback'] },
+    run_id: { type: 'string', required: true },
+    allowlist: { type: 'array', items: { type: 'object' } },
+    expected_fingerprint: { type: 'string' },
+    apply_enabled: { type: 'boolean' },
+    accept_ambiguous_commit: { type: 'boolean' },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError('permission_denied', 'purge_pages_exact is local-only and must be called through the local CLI.');
+    }
+    const action = requireExactString(p, 'action') as 'plan' | 'apply' | 'verify' | 'rollback';
+    if (!['plan', 'apply', 'verify', 'rollback'].includes(action)) {
+      throw new OperationError('invalid_params', 'unsupported purge-pages action');
+    }
+    const runId = requireExactString(p, 'run_id');
+    let allowlist: PurgeAllowlistEntry[] | undefined;
+    if (p.allowlist !== undefined) {
+      if (!Array.isArray(p.allowlist)) throw new OperationError('invalid_params', 'allowlist must be an array');
+      allowlist = p.allowlist.map((raw, index) => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+          throw new OperationError('invalid_params', `allowlist[${index}] must be an object`);
+        }
+        const entry = raw as Record<string, unknown>;
+        const slug = requireLowercaseExactSlug(entry.slug);
+        if (typeof entry.deleted_at !== 'string' || typeof entry.content_hash !== 'string') {
+          throw new OperationError('invalid_params', `allowlist[${index}] requires deleted_at and content_hash strings`);
+        }
+        return { slug, deletedAt: entry.deleted_at, contentHash: entry.content_hash };
+      });
+    }
+    if (ctx.dryRun && action !== 'plan') {
+      return { dry_run: true, action: `purge_pages_exact:${action}`, run_id: runId };
+    }
+    try {
+      return await runPurgePagesExact(ctx.engine, {
+        action,
+        runId,
+        sourceId: ctx.sourceId || 'default',
+        allowlist,
         expectedFingerprint: typeof p.expected_fingerprint === 'string' ? p.expected_fingerprint : undefined,
         applyEnabled: p.apply_enabled === true,
         acceptAmbiguousCommit: p.accept_ambiguous_commit === true,
@@ -5709,9 +6034,10 @@ const chronicle_backfill: Operation = {
 
 export const operations: Operation[] = [
   // Page CRUD
-  get_page, put_page, put_page_file_exact, patch_page_metadata_exact, delete_page, list_pages,
+  get_page, put_page, create_page_file_exact, put_page_file_exact, patch_page_metadata_exact,
+  soft_delete_page_exact, delete_page, list_pages,
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)
-  restore_page, purge_deleted_pages,
+  restore_page_exact, restore_page, purge_pages_exact, purge_deleted_pages,
   // Search
   search, query,
   // v0.36 Phase 2: image-as-query

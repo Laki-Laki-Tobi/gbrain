@@ -203,6 +203,33 @@ export interface ImportResult {
   flag_reason?: 'markup_heavy' | 'oversized';
 }
 
+const HASH_EPHEMERAL_FRONTMATTER_KEYS = [
+  'captured_at',
+  'ingested_at',
+  QUARANTINE_KEY,
+  CONTENT_FLAG_KEY,
+  EMBED_SKIP_KEY,
+];
+
+export function stableImportFrontmatter(frontmatter: Record<string, unknown>): Record<string, unknown> {
+  const stable = { ...frontmatter };
+  for (const key of HASH_EPHEMERAL_FRONTMATTER_KEYS) delete stable[key];
+  return stable;
+}
+
+export function computeImportContentHash(parsed: ParsedPage): string {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      title: parsed.title,
+      type: parsed.type,
+      compiled_truth: parsed.compiled_truth,
+      timeline: parsed.timeline,
+      frontmatter: stableImportFrontmatter(parsed.frontmatter),
+      tags: [...parsed.tags].sort(),
+    }))
+    .digest('hex');
+}
+
 const MAX_FILE_SIZE = 5_000_000; // 5MB
 
 /**
@@ -526,29 +553,6 @@ export async function importFromContent(
   // is real, unbounded embedding spend). Same bug class as the captured_at /
   // ingested_at fix above; the gate re-derives the markers deterministically
   // on the next import, so dropping them from the hash is safe.
-  const HASH_EPHEMERAL_FRONTMATTER_KEYS = [
-    'captured_at',
-    'ingested_at',
-    QUARANTINE_KEY,
-    CONTENT_FLAG_KEY,
-    EMBED_SKIP_KEY,
-  ];
-  const stableFrontmatter: Record<string, unknown> = { ...parsed.frontmatter };
-  for (const k of HASH_EPHEMERAL_FRONTMATTER_KEYS) {
-    delete stableFrontmatter[k];
-  }
-  // Hash includes all meaningful fields for idempotency.
-  const hash = createHash('sha256')
-    .update(JSON.stringify({
-      title: parsed.title,
-      type: parsed.type,
-      compiled_truth: parsed.compiled_truth,
-      timeline: parsed.timeline,
-      frontmatter: stableFrontmatter,
-      tags: parsed.tags.sort(),
-    }))
-    .digest('hex');
-
   const parsedPage: ParsedPage = {
     type: parsed.type,
     title: parsed.title,
@@ -557,6 +561,9 @@ export async function importFromContent(
     frontmatter: parsed.frontmatter,
     tags: parsed.tags,
   };
+  // Hash includes all meaningful fields for idempotency. Gate-owned audit
+  // markers are intentionally excluded by computeImportContentHash.
+  const hash = computeImportContentHash(parsedPage);
 
   const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
   if (existing?.content_hash === hash && !opts.forceRechunk) {

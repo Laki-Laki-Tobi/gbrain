@@ -2,6 +2,23 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.4] - 2026-08-28
+
+### Added
+- Four local-admin operations provide source-scoped exact corpus remediation:
+  private-file creation of absent lowercase pages, hash-gated soft-delete,
+  deleted-identity-gated restore, and bounded allowlisted physical purge.
+- `purge_pages_exact` uses an immutable plan fingerprint, private crash-durable
+  graph backup, exact apply/readback, verify, transactional rollback, and
+  operator-gated ambiguous-commit recovery. It never falls through to the
+  broad age-based purge primitive and accepts at most 100 exact identities.
+
+### Changed
+- Canonical import hashing is exposed as a shared pure helper so exact-create
+  validation and normal ingestion cannot drift apart.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.3] - 2026-08-27
 
 ### Added
