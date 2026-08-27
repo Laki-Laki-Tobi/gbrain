@@ -696,6 +696,13 @@ const get_page: Operation = {
     // non-default page. We already hold the resolved page, so its source is
     // unambiguous.
     const tags = await ctx.engine.getTags(page.slug, { sourceId: page.source_id });
+    const aliases = await ctx.engine.executeRaw<{ alias_norm: string }>(
+      `SELECT alias_norm
+         FROM page_aliases
+        WHERE source_id = $1 AND slug = $2
+        ORDER BY alias_norm`,
+      [page.source_id, page.slug],
+    );
     // Privacy boundary for the per-token allow-list (v0.28.6 for takes,
     // v0.32.2 for facts).
     //
@@ -738,6 +745,7 @@ const get_page: Operation = {
     return {
       ...visibleBody,
       tags,
+      aliases: aliases.map((row) => row.alias_norm),
       ...(resolved_slug ? { resolved_slug } : {}),
       ...(content_flag ? { content_flag } : {}),
     };

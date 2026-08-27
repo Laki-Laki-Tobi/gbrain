@@ -2,6 +2,13 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.10] - 2026-08-28
+
+### Fixed
+- Return the normalized `page_aliases` projection from `get_page` alongside
+  tags so exact remediation callers can verify durable alias state instead of
+  relying only on frontmatter or `pages.content_hash`.
+
 ## [0.42.59.9] - 2026-08-28
 
 ### Fixed

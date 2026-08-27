@@ -366,6 +366,9 @@ describe('put_page_file_exact', () => {
            FROM pages WHERE source_id = $1 AND slug = $2`,
         ['default', before.slug],
       );
+      const projectedRead = await operationsByName.get_page.handler(ctx(), {
+        slug: before.slug,
+      }) as { aliases: string[] };
 
       expect(after.title).toBe('After');
       expect(after.compiled_truth).toContain(marker);
@@ -381,6 +384,7 @@ describe('put_page_file_exact', () => {
       expect(await engine.executeRaw(
         `SELECT alias_norm FROM page_aliases WHERE source_id = 'default' AND slug = $1`, [before.slug],
       )).toEqual([{ alias_norm: 'exact file alias' }]);
+      expect(projectedRead.aliases).toEqual(['exact file alias']);
       expect(provenance[0]).toEqual({ source_kind: null, source_uri: null, ingested_via: null });
       expect(result).toEqual({ status: 'written', slug: before.slug!, content_hash: after.content_hash! });
       expect(JSON.stringify(result)).not.toContain(marker);
