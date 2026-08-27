@@ -2,7 +2,7 @@ import postgres from 'postgres';
 import type {
   BrainEngine,
   BatchOpts,
-  LinkBatchInput, TimelineBatchInput,
+  ExactLinkIdentity, ExactPageMetadataPatch, LinkBatchInput, TimelineBatchInput,
   ReservedConnection,
   DreamVerdict, DreamVerdictInput,
   FileSpec, FileRow,
@@ -1030,6 +1030,48 @@ export class PostgresEngine implements BrainEngine {
     return rowToPage(rows[0]);
   }
 
+  async patchPageMetadataExact(
+    slug: string,
+    expectedContentHash: string,
+    mutation: ExactPageMetadataPatch,
+    opts?: { sourceId?: string },
+  ): Promise<{ before: Page; content_hash: string }> {
+    const sourceId = opts?.sourceId ?? 'default';
+    const before = await this.getPage(slug, { sourceId });
+    if (!before) throw new Error(`patchPageMetadataExact failed: active page "${slug}" not found`);
+    if (before.content_hash !== expectedContentHash) {
+      throw new Error(`patchPageMetadataExact drift: content hash changed for "${slug}"`);
+    }
+    const overlap = mutation.unset.find((key) => Object.hasOwn(mutation.patch, key));
+    if (overlap) throw new Error(`patchPageMetadataExact failed: key "${overlap}" cannot be set and unset`);
+
+    const frontmatter = { ...(before.frontmatter || {}), ...mutation.patch };
+    for (const key of mutation.unset) delete frontmatter[key];
+    const nextHash = contentHash({
+      type: before.type,
+      title: before.title,
+      compiled_truth: before.compiled_truth,
+      timeline: before.timeline,
+      frontmatter,
+    });
+    const sql = this.sql;
+    const rows = await sql`
+      UPDATE pages
+      SET frontmatter = ${sql.json(frontmatter as Parameters<typeof sql.json>[0])},
+          content_hash = ${nextHash},
+          updated_at = now()
+      WHERE source_id = ${sourceId}
+        AND slug = ${slug}
+        AND content_hash = ${expectedContentHash}
+        AND deleted_at IS NULL
+      RETURNING content_hash
+    `;
+    if (rows.length !== 1) {
+      throw new Error(`patchPageMetadataExact drift: atomic update rejected for "${slug}"`);
+    }
+    return { before, content_hash: nextHash };
+  }
+
   async deletePage(slug: string, opts?: { sourceId?: string }): Promise<void> {
     const sql = this.sql;
     const sourceId = opts?.sourceId ?? 'default';
@@ -1249,10 +1291,14 @@ export class PostgresEngine implements BrainEngine {
     const sql = this.sql;
     // v0.31.8 (D12): two-branch. See pglite-engine.ts:getAllSlugs for context.
     if (opts?.sourceId) {
-      const rows = await sql`SELECT slug FROM pages WHERE source_id = ${opts.sourceId}`;
+      const rows = await sql`
+        SELECT slug FROM pages
+        WHERE source_id = ${opts.sourceId}
+          AND deleted_at IS NULL
+      `;
       return new Set(rows.map((r) => r.slug as string));
     }
-    const rows = await sql`SELECT slug FROM pages`;
+    const rows = await sql`SELECT slug FROM pages WHERE deleted_at IS NULL`;
     return new Set(rows.map((r) => r.slug as string));
   }
 
@@ -1517,7 +1563,7 @@ export class PostgresEngine implements BrainEngine {
     }));
   }
 
-  async resolveSlugs(partial: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<string[]> {
+  async resolveSlugs(partial: string, opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean }): Promise<string[]> {
     const sql = this.sql;
 
     // v0.41.13 #1436: source scope via postgres.js tagged-template
@@ -1527,6 +1573,7 @@ export class PostgresEngine implements BrainEngine {
     // — they're not legitimate match targets for a remote `get_page`.
     const sources = opts?.sourceIds ?? null;
     const scalar = opts?.sourceId ?? null;
+    const activeFragment = opts?.includeDeleted ? sql`` : sql` AND deleted_at IS NULL`;
     const scopeFragment = sources
       ? sql` AND source_id = ANY(${sources}::text[])`
       : scalar
@@ -1534,14 +1581,14 @@ export class PostgresEngine implements BrainEngine {
         : sql``;
 
     // Try exact match first
-    const exact = await sql`SELECT slug FROM pages WHERE slug = ${partial} AND deleted_at IS NULL${scopeFragment}`;
+    const exact = await sql`SELECT slug FROM pages WHERE slug = ${partial}${activeFragment}${scopeFragment}`;
     if (exact.length > 0) return [exact[0].slug];
 
     // Fuzzy match via pg_trgm
     const fuzzy = await sql`
       SELECT slug, similarity(title, ${partial}) AS sim
       FROM pages
-      WHERE deleted_at IS NULL AND (title % ${partial} OR slug ILIKE ${'%' + partial + '%'})${scopeFragment}
+      WHERE (title % ${partial} OR slug ILIKE ${'%' + partial + '%'})${activeFragment}${scopeFragment}
       ORDER BY sim DESC
       LIMIT 5
     `;
@@ -2550,7 +2597,12 @@ export class PostgresEngine implements BrainEngine {
     linkSource?: string,
     originSlug?: string,
     originField?: string,
-    opts?: { fromSourceId?: string; toSourceId?: string; originSourceId?: string },
+    opts?: {
+      fromSourceId?: string;
+      toSourceId?: string;
+      originSourceId?: string;
+      resolutionType?: 'qualified' | 'unqualified';
+    },
   ): Promise<void> {
     const sql = this.sql;
     const fromSrc = opts?.fromSourceId ?? 'default';
@@ -2576,16 +2628,17 @@ export class PostgresEngine implements BrainEngine {
     // pointing at the wrong pages.
     const src = linkSource ?? 'markdown';
     await sql`
-      INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
-      SELECT f.id, t.id, v.link_type, v.context, v.link_source, o.id, v.origin_field
-      FROM (VALUES (${from}, ${to}, ${linkType || ''}, ${sanitizeForJsonb(context || '')}, ${src}, ${originSlug ?? null}, ${originField ?? null}, ${fromSrc}, ${toSrc}, ${originSrc}))
-        AS v(from_slug, to_slug, link_type, context, link_source, origin_slug, origin_field, from_source_id, to_source_id, origin_source_id)
+      INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field, resolution_type)
+      SELECT f.id, t.id, v.link_type, v.context, v.link_source, o.id, v.origin_field, v.resolution_type
+      FROM (VALUES (${from}, ${to}, ${linkType || ''}, ${sanitizeForJsonb(context || '')}, ${src}, ${originSlug ?? null}, ${originField ?? null}, ${fromSrc}, ${toSrc}, ${originSrc}, ${opts?.resolutionType ?? null}))
+        AS v(from_slug, to_slug, link_type, context, link_source, origin_slug, origin_field, from_source_id, to_source_id, origin_source_id, resolution_type)
       JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id
       JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id
       LEFT JOIN pages o ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
       ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO UPDATE SET
         context = EXCLUDED.context,
-        origin_field = EXCLUDED.origin_field
+        origin_field = EXCLUDED.origin_field,
+        resolution_type = EXCLUDED.resolution_type
     `;
   }
 
@@ -2607,12 +2660,12 @@ export class PostgresEngine implements BrainEngine {
     const rows = buildLinkRows(links);
     const result = await executeRawJsonb(
       this,
-      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, link_kind, origin_page_id, origin_field)
-       SELECT f.id, t.id, v.link_type, v.context, v.link_source, v.link_kind, o.id, v.origin_field
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, link_kind, origin_page_id, origin_field, resolution_type)
+       SELECT f.id, t.id, v.link_type, v.context, v.link_source, v.link_kind, o.id, v.origin_field, v.resolution_type
        FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(
          from_slug text, to_slug text, link_type text, context text, link_source text,
          origin_slug text, origin_field text, from_source_id text, to_source_id text,
-         origin_source_id text, link_kind text
+         origin_source_id text, link_kind text, resolution_type text
        )
        JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id
        JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id
@@ -2625,53 +2678,95 @@ export class PostgresEngine implements BrainEngine {
     return result.length;
   }
 
+  async restoreLinkExact(edge: ExactLinkIdentity, opts?: { sourceId?: string }): Promise<void> {
+    const sourceId = opts?.sourceId ?? 'default';
+    const context = sanitizeForJsonb(edge.context);
+    if (context !== edge.context) {
+      throw new Error('restoreLinkExact failed: context contains unsupported characters');
+    }
+    const slugs = [edge.from_slug, edge.to_slug, edge.origin_slug]
+      .filter((value): value is string => value !== null);
+    for (const slug of slugs) {
+      const page = await this.getPage(slug, { sourceId, includeDeleted: true });
+      if (!page) throw new Error(`restoreLinkExact failed: page "${slug}" (source=${sourceId}) not found`);
+    }
+
+    const sql = this.sql;
+    await sql`
+      INSERT INTO links (
+        from_page_id, to_page_id, link_type, context, link_source,
+        origin_page_id, origin_field, resolution_type
+      )
+      SELECT f.id, t.id, ${edge.link_type}, ${context}, ${edge.link_source},
+             o.id, ${edge.origin_field}, ${edge.resolution_type}
+      FROM pages f
+      JOIN pages t ON t.slug = ${edge.to_slug} AND t.source_id = ${sourceId}
+      LEFT JOIN pages o ON o.slug = ${edge.origin_slug} AND o.source_id = ${sourceId}
+      WHERE f.slug = ${edge.from_slug} AND f.source_id = ${sourceId}
+      ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id)
+      DO UPDATE SET
+        context = EXCLUDED.context,
+        origin_field = EXCLUDED.origin_field,
+        resolution_type = EXCLUDED.resolution_type
+    `;
+  }
+
   async removeLink(
     from: string,
     to: string,
     linkType?: string,
     linkSource?: string,
-    opts?: { fromSourceId?: string; toSourceId?: string },
+    opts?: {
+      fromSourceId?: string;
+      toSourceId?: string;
+      originSourceId?: string;
+      originSlug?: string;
+      originField?: string;
+      context?: string;
+      resolutionType?: 'qualified' | 'unqualified';
+      linkSourceIsNull?: boolean;
+      originSlugIsNull?: boolean;
+      originFieldIsNull?: boolean;
+      resolutionTypeIsNull?: boolean;
+    },
   ): Promise<void> {
     const sql = this.sql;
     const fromSrc = opts?.fromSourceId ?? 'default';
     const toSrc = opts?.toSourceId ?? 'default';
-    // Build up filters dynamically. linkType + linkSource are independent
-    // optional constraints; all four combinations are valid. Each branch's
-    // page-id subquery is source-qualified so multi-source brains don't
-    // delete the wrong (from, to) pair.
-    if (linkType !== undefined && linkSource !== undefined) {
-      await sql`
-        DELETE FROM links
-        WHERE from_page_id = (SELECT id FROM pages WHERE slug = ${from} AND source_id = ${fromSrc})
-          AND to_page_id = (SELECT id FROM pages WHERE slug = ${to} AND source_id = ${toSrc})
-          AND link_type = ${linkType}
-          AND link_source IS NOT DISTINCT FROM ${linkSource}
-      `;
-    } else if (linkType !== undefined) {
-      await sql`
-        DELETE FROM links
-        WHERE from_page_id = (SELECT id FROM pages WHERE slug = ${from} AND source_id = ${fromSrc})
-          AND to_page_id = (SELECT id FROM pages WHERE slug = ${to} AND source_id = ${toSrc})
-          AND link_type = ${linkType}
-      `;
-    } else if (linkSource !== undefined) {
-      await sql`
-        DELETE FROM links
-        WHERE from_page_id = (SELECT id FROM pages WHERE slug = ${from} AND source_id = ${fromSrc})
-          AND to_page_id = (SELECT id FROM pages WHERE slug = ${to} AND source_id = ${toSrc})
-          AND link_source IS NOT DISTINCT FROM ${linkSource}
-      `;
-    } else {
-      await sql`
-        DELETE FROM links
-        WHERE from_page_id = (SELECT id FROM pages WHERE slug = ${from} AND source_id = ${fromSrc})
-          AND to_page_id = (SELECT id FROM pages WHERE slug = ${to} AND source_id = ${toSrc})
-      `;
-    }
+    const linkTypeFilter = linkType !== undefined ? sql`AND link_type = ${linkType}` : sql``;
+    const linkSourceFilter = opts?.linkSourceIsNull
+      ? sql`AND link_source IS NULL`
+      : linkSource !== undefined ? sql`AND link_source IS NOT DISTINCT FROM ${linkSource}` : sql``;
+    const originFilter = opts?.originSlugIsNull
+      ? sql`AND origin_page_id IS NULL`
+      : opts?.originSlug !== undefined
+      ? sql`AND origin_page_id = (SELECT id FROM pages WHERE slug = ${opts.originSlug} AND source_id = ${opts.originSourceId ?? fromSrc})`
+      : sql``;
+    const originFieldFilter = opts?.originFieldIsNull
+      ? sql`AND origin_field IS NULL`
+      : opts?.originField !== undefined ? sql`AND origin_field IS NOT DISTINCT FROM ${opts.originField}` : sql``;
+    const contextFilter = opts?.context !== undefined ? sql`AND context = ${opts.context}` : sql``;
+    const resolutionFilter = opts?.resolutionTypeIsNull
+      ? sql`AND resolution_type IS NULL`
+      : opts?.resolutionType !== undefined ? sql`AND resolution_type IS NOT DISTINCT FROM ${opts.resolutionType}` : sql``;
+    await sql`
+      DELETE FROM links
+      WHERE from_page_id = (SELECT id FROM pages WHERE slug = ${from} AND source_id = ${fromSrc})
+        AND to_page_id = (SELECT id FROM pages WHERE slug = ${to} AND source_id = ${toSrc})
+        ${linkTypeFilter}
+        ${linkSourceFilter}
+        ${originFilter}
+        ${originFieldFilter}
+        ${contextFilter}
+        ${resolutionFilter}
+    `;
   }
 
-  async getLinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]> {
+  async getLinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean }): Promise<Link[]> {
     const sql = this.sql;
+    const activeEndpoints = opts?.includeDeleted ? sql`` : sql`AND f.deleted_at IS NULL AND t.deleted_at IS NULL`;
+    const activeOrigin = opts?.includeDeleted ? sql`` : sql`AND o.deleted_at IS NULL`;
+    const visibleOrigin = sql`AND (l.origin_page_id IS NULL OR o.id IS NOT NULL)`;
     // #2200: federated grant scopes ALL THREE page endpoints — from, to, AND the
     // origin (the page that authored the edge, surfaced as origin_slug). Scoping
     // only from+to would still leak an out-of-grant origin's slug; the origin
@@ -2682,12 +2777,14 @@ export class PostgresEngine implements BrainEngine {
       const rows = await sql`
         SELECT f.slug as from_slug, t.slug as to_slug,
                l.link_type, l.context, l.link_source,
-               o.slug as origin_slug, l.origin_field
+               o.slug as origin_slug, l.origin_field, l.resolution_type
         FROM links l
         JOIN pages f ON f.id = l.from_page_id
         JOIN pages t ON t.id = l.to_page_id
-        LEFT JOIN pages o ON o.id = l.origin_page_id AND o.source_id = ANY(${ids}::text[])
+        LEFT JOIN pages o ON o.id = l.origin_page_id AND o.source_id = ANY(${ids}::text[]) ${activeOrigin}
         WHERE f.slug = ${slug} AND f.source_id = ANY(${ids}::text[]) AND t.source_id = ANY(${ids}::text[])
+          ${activeEndpoints}
+          ${visibleOrigin}
       `;
       return rows as unknown as Link[];
     }
@@ -2699,30 +2796,37 @@ export class PostgresEngine implements BrainEngine {
       const rows = await sql`
         SELECT f.slug as from_slug, t.slug as to_slug,
                l.link_type, l.context, l.link_source,
-               o.slug as origin_slug, l.origin_field
+               o.slug as origin_slug, l.origin_field, l.resolution_type
         FROM links l
         JOIN pages f ON f.id = l.from_page_id
         JOIN pages t ON t.id = l.to_page_id
-        LEFT JOIN pages o ON o.id = l.origin_page_id
+        LEFT JOIN pages o ON o.id = l.origin_page_id ${activeOrigin}
         WHERE f.slug = ${slug} AND f.source_id = ${opts.sourceId}
+          ${activeEndpoints}
+          ${visibleOrigin}
       `;
       return rows as unknown as Link[];
     }
     const rows = await sql`
       SELECT f.slug as from_slug, t.slug as to_slug,
              l.link_type, l.context, l.link_source,
-             o.slug as origin_slug, l.origin_field
+             o.slug as origin_slug, l.origin_field, l.resolution_type
       FROM links l
       JOIN pages f ON f.id = l.from_page_id
       JOIN pages t ON t.id = l.to_page_id
-      LEFT JOIN pages o ON o.id = l.origin_page_id
+      LEFT JOIN pages o ON o.id = l.origin_page_id ${activeOrigin}
       WHERE f.slug = ${slug}
+        ${activeEndpoints}
+        ${visibleOrigin}
     `;
     return rows as unknown as Link[];
   }
 
-  async getBacklinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]> {
+  async getBacklinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean }): Promise<Link[]> {
     const sql = this.sql;
+    const activeEndpoints = opts?.includeDeleted ? sql`` : sql`AND f.deleted_at IS NULL AND t.deleted_at IS NULL`;
+    const activeOrigin = opts?.includeDeleted ? sql`` : sql`AND o.deleted_at IS NULL`;
+    const visibleOrigin = sql`AND (l.origin_page_id IS NULL OR o.id IS NOT NULL)`;
     // #2200: federated grant scopes all three endpoints (mirrors getLinks) — the
     // referrer (from), the queried page (to), AND the origin — so neither a
     // foreign referrer nor a foreign origin slug is disclosed to the caller.
@@ -2731,12 +2835,14 @@ export class PostgresEngine implements BrainEngine {
       const rows = await sql`
         SELECT f.slug as from_slug, t.slug as to_slug,
                l.link_type, l.context, l.link_source,
-               o.slug as origin_slug, l.origin_field
+               o.slug as origin_slug, l.origin_field, l.resolution_type
         FROM links l
         JOIN pages f ON f.id = l.from_page_id
         JOIN pages t ON t.id = l.to_page_id
-        LEFT JOIN pages o ON o.id = l.origin_page_id AND o.source_id = ANY(${ids}::text[])
+        LEFT JOIN pages o ON o.id = l.origin_page_id AND o.source_id = ANY(${ids}::text[]) ${activeOrigin}
         WHERE t.slug = ${slug} AND t.source_id = ANY(${ids}::text[]) AND f.source_id = ANY(${ids}::text[])
+          ${activeEndpoints}
+          ${visibleOrigin}
       `;
       return rows as unknown as Link[];
     }
@@ -2745,24 +2851,28 @@ export class PostgresEngine implements BrainEngine {
       const rows = await sql`
         SELECT f.slug as from_slug, t.slug as to_slug,
                l.link_type, l.context, l.link_source,
-               o.slug as origin_slug, l.origin_field
+               o.slug as origin_slug, l.origin_field, l.resolution_type
         FROM links l
         JOIN pages f ON f.id = l.from_page_id
         JOIN pages t ON t.id = l.to_page_id
-        LEFT JOIN pages o ON o.id = l.origin_page_id
+        LEFT JOIN pages o ON o.id = l.origin_page_id ${activeOrigin}
         WHERE t.slug = ${slug} AND t.source_id = ${opts.sourceId}
+          ${activeEndpoints}
+          ${visibleOrigin}
       `;
       return rows as unknown as Link[];
     }
     const rows = await sql`
       SELECT f.slug as from_slug, t.slug as to_slug,
              l.link_type, l.context, l.link_source,
-             o.slug as origin_slug, l.origin_field
+             o.slug as origin_slug, l.origin_field, l.resolution_type
       FROM links l
       JOIN pages f ON f.id = l.from_page_id
       JOIN pages t ON t.id = l.to_page_id
-      LEFT JOIN pages o ON o.id = l.origin_page_id
+      LEFT JOIN pages o ON o.id = l.origin_page_id ${activeOrigin}
       WHERE t.slug = ${slug}
+        ${activeEndpoints}
+        ${visibleOrigin}
     `;
     return rows as unknown as Link[];
   }
@@ -2813,6 +2923,7 @@ export class PostgresEngine implements BrainEngine {
       FROM pages
       WHERE similarity(title, ${name}) >= ${minSimilarity}
         AND slug LIKE ${prefixPattern}
+        AND deleted_at IS NULL
       ORDER BY sim DESC, slug ASC
       LIMIT 1
     `;
@@ -2848,8 +2959,11 @@ export class PostgresEngine implements BrainEngine {
     const aggScope = useSourceIds
       ? sql`AND p3.source_id = ANY(${opts!.sourceIds!}::text[])`
       : opts?.sourceId
-        ? sql`AND p3.source_id = ${opts.sourceId}`
-        : sql``;
+          ? sql`AND p3.source_id = ${opts.sourceId}`
+          : sql``;
+    const activeSeed = sql`AND p.deleted_at IS NULL`;
+    const activeStep = sql`AND p2.deleted_at IS NULL`;
+    const activeAgg = sql`AND p3.deleted_at IS NULL`;
     // T8 (v0.36+): frontier cap. When set, the recursive term applies a
     // parenthesized LIMIT N with ORDER BY (slug, id) for stable selection.
     // Postgres' parenthesized-LIMIT inside a recursive term caps per
@@ -2866,6 +2980,7 @@ export class PostgresEngine implements BrainEngine {
              WHERE g.depth < ${depth}
                AND NOT (p2.id = ANY(g.visited))
                ${stepScope}
+               ${activeStep}
              ORDER BY p2.slug ASC, p2.id ASC
              LIMIT ${cap})`
       : sql`SELECT p2.id, p2.slug, p2.title, p2.type, g.depth + 1, g.visited || p2.id
@@ -2874,12 +2989,13 @@ export class PostgresEngine implements BrainEngine {
             JOIN pages p2 ON p2.id = l.to_page_id
             WHERE g.depth < ${depth}
               AND NOT (p2.id = ANY(g.visited))
-              ${stepScope}`;
+              ${stepScope}
+              ${activeStep}`;
     // Cycle prevention: visited array tracks page IDs already in the path.
     const rows = await sql`
       WITH RECURSIVE graph AS (
         SELECT p.id, p.slug, p.title, p.type, 0 as depth, ARRAY[p.id] as visited
-        FROM pages p WHERE p.slug = ${slug} ${seedScope}
+        FROM pages p WHERE p.slug = ${slug} ${seedScope} ${activeSeed}
 
         UNION ALL
 
@@ -2897,7 +3013,7 @@ export class PostgresEngine implements BrainEngine {
           (SELECT jsonb_agg(DISTINCT jsonb_build_object('to_slug', p3.slug, 'link_type', l2.link_type))
            FROM links l2
            JOIN pages p3 ON p3.id = l2.to_page_id
-           WHERE l2.from_page_id = g.id ${aggScope}),
+           WHERE l2.from_page_id = g.id ${aggScope} ${activeAgg}),
           '[]'::jsonb
         ) as links
       FROM graph g
@@ -2961,7 +3077,7 @@ export class PostgresEngine implements BrainEngine {
       rows = await sql`
         WITH RECURSIVE walk AS (
           SELECT p.id, p.slug, 0::int as depth, ARRAY[p.id] as visited
-          FROM pages p WHERE p.slug = ${slug} ${seedScope}
+          FROM pages p WHERE p.slug = ${slug} AND p.deleted_at IS NULL ${seedScope}
           UNION ALL
           SELECT p2.id, p2.slug, w.depth + 1, w.visited || p2.id
           FROM walk w
@@ -2969,6 +3085,7 @@ export class PostgresEngine implements BrainEngine {
           JOIN pages p2 ON p2.id = l.to_page_id
           WHERE w.depth < ${depth}
             AND NOT (p2.id = ANY(w.visited))
+            AND p2.deleted_at IS NULL
             AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
             ${stepScope}
         )
@@ -2978,6 +3095,7 @@ export class PostgresEngine implements BrainEngine {
         JOIN links l ON l.from_page_id = w.id
         JOIN pages p2 ON p2.id = l.to_page_id
         WHERE w.depth < ${depth}
+          AND p2.deleted_at IS NULL
           AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
           ${stepScope}
         ORDER BY depth, from_slug, to_slug
@@ -2986,7 +3104,7 @@ export class PostgresEngine implements BrainEngine {
       rows = await sql`
         WITH RECURSIVE walk AS (
           SELECT p.id, p.slug, 0::int as depth, ARRAY[p.id] as visited
-          FROM pages p WHERE p.slug = ${slug} ${seedScope}
+          FROM pages p WHERE p.slug = ${slug} AND p.deleted_at IS NULL ${seedScope}
           UNION ALL
           SELECT p2.id, p2.slug, w.depth + 1, w.visited || p2.id
           FROM walk w
@@ -2994,6 +3112,7 @@ export class PostgresEngine implements BrainEngine {
           JOIN pages p2 ON p2.id = l.from_page_id
           WHERE w.depth < ${depth}
             AND NOT (p2.id = ANY(w.visited))
+            AND p2.deleted_at IS NULL
             AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
             ${stepScope}
         )
@@ -3003,6 +3122,7 @@ export class PostgresEngine implements BrainEngine {
         JOIN links l ON l.to_page_id = w.id
         JOIN pages p2 ON p2.id = l.from_page_id
         WHERE w.depth < ${depth}
+          AND p2.deleted_at IS NULL
           AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
           ${stepScope}
         ORDER BY depth, from_slug, to_slug
@@ -3011,7 +3131,7 @@ export class PostgresEngine implements BrainEngine {
       rows = await sql`
         WITH RECURSIVE walk AS (
           SELECT p.id, 0::int as depth, ARRAY[p.id] as visited
-          FROM pages p WHERE p.slug = ${slug} ${seedScope}
+          FROM pages p WHERE p.slug = ${slug} AND p.deleted_at IS NULL ${seedScope}
           UNION ALL
           SELECT p2.id, w.depth + 1, w.visited || p2.id
           FROM walk w
@@ -3019,6 +3139,7 @@ export class PostgresEngine implements BrainEngine {
           JOIN pages p2 ON p2.id = CASE WHEN l.from_page_id = w.id THEN l.to_page_id ELSE l.from_page_id END
           WHERE w.depth < ${depth}
             AND NOT (p2.id = ANY(w.visited))
+            AND p2.deleted_at IS NULL
             AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
             ${stepScope}
         )
@@ -3029,6 +3150,8 @@ export class PostgresEngine implements BrainEngine {
         JOIN pages pf ON pf.id = l.from_page_id
         JOIN pages pt ON pt.id = l.to_page_id
         WHERE w.depth < ${depth}
+          AND pf.deleted_at IS NULL
+          AND pt.deleted_at IS NULL
           AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
           ${pfScope}
           ${ptScope}

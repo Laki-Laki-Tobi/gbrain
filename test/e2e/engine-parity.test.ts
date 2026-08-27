@@ -633,7 +633,7 @@ async function seedFederated(eng: BrainEngine) {
   await eng.addLink('fed/doc', 'fed/outside', 'leak', 'cites', 'markdown', undefined, undefined, { fromSourceId: 'beta', toSourceId: 'default' });
   await eng.addLink('fed/target', 'fed/doc', 'inback', 'cites', 'markdown', undefined, undefined, { fromSourceId: 'beta', toSourceId: 'beta' });
   await eng.addLink('fed/outside', 'fed/doc', 'leakback', 'cites', 'markdown', undefined, undefined, { fromSourceId: 'default', toSourceId: 'beta' });
-  // F1: in-grant edge authored by an out-of-grant origin — origin_slug must null out.
+  // F1: in-grant edge authored by an out-of-grant origin must be hidden.
   await eng.addLink('fed/doc', 'fed/target', 'originleak', 'mentions', 'frontmatter', 'fed/outside', 'related', { fromSourceId: 'beta', toSourceId: 'beta', originSourceId: 'default' });
   await eng.addTimelineEntry('fed/doc', { date: '2026-02-02', source: 't', summary: 'fed event', detail: 'd' }, { sourceId: 'beta' });
   // Second-dated entry so the after/before fragment paths (D5A Postgres refactor) are exercised.
@@ -671,11 +671,10 @@ describeBoth('Engine parity — federated sourceIds[] secondary reads (#2200)', 
     const pglite = (await pgliteEngine.getLinks('fed/doc', grant)).map(l => l.to_slug).sort();
     expect(pg).toEqual(pglite);
     expect([...new Set(pg)]).toEqual(['fed/target']); // far-endpoint 'fed/outside' excluded
-    // F1: origin_slug nulled identically on both engines when origin is out-of-grant.
-    const pgOrigins = (await pgEngine.getLinks('fed/doc', grant)).map(l => l.origin_slug ?? null);
-    const pgliteOrigins = (await pgliteEngine.getLinks('fed/doc', grant)).map(l => l.origin_slug ?? null);
-    expect(pgOrigins.sort()).toEqual(pgliteOrigins.sort());
-    expect(pgOrigins).not.toContain('fed/outside');
+    const pgContexts = (await pgEngine.getLinks('fed/doc', grant)).map(l => l.context);
+    const pgliteContexts = (await pgliteEngine.getLinks('fed/doc', grant)).map(l => l.context);
+    expect(pgContexts.sort()).toEqual(pgliteContexts.sort());
+    expect(pgContexts).not.toContain('originleak');
   });
 
   test('getBacklinks identical under sourceIds[] (both endpoints scoped)', async () => {

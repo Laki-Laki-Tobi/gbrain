@@ -96,6 +96,7 @@ export interface LinkRow {
   link_source: string;
   origin_slug: string | null;
   origin_field: string | null;
+  resolution_type: 'qualified' | 'unqualified' | null;
   from_source_id: string;
   to_source_id: string;
   origin_source_id: string;
@@ -137,6 +138,7 @@ export function buildLinkRows(links: LinkBatchInput[]): LinkRow[] {
     link_source: l.link_source || 'markdown',
     origin_slug: l.origin_slug || null,
     origin_field: l.origin_field || null,
+    resolution_type: l.resolution_type ?? null,
     from_source_id: l.from_source_id || 'default',
     to_source_id: l.to_source_id || 'default',
     origin_source_id: l.origin_source_id || 'default',
