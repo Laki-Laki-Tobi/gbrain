@@ -282,6 +282,17 @@ export async function importFromContent(
      */
     createOnly?: boolean;
     /**
+     * Local-admin exact merge only. The importer computes and verifies the
+     * approved postimage before writes, then locks the active source/slug row
+     * and rechecks its preimage hash inside the write transaction. Aliases are
+     * projected in that same transaction instead of the normal fail-soft
+     * post-commit path.
+     */
+    exactMerge?: {
+      expectedPreimageContentHash: string;
+      expectedPostimageContentHash: string;
+    };
+    /**
      * v0.39.0.0 T1.5: active schema pack for type inference. When set, parseMarkdown
      * uses the pack's path_prefixes instead of the hardcoded gbrain-base table.
      * When unset, falls back to pre-v0.39 behavior (parity gate stays green).
@@ -571,12 +582,18 @@ export async function importFromContent(
   // Hash includes all meaningful fields for idempotency. Gate-owned audit
   // markers are intentionally excluded by computeImportContentHash.
   const hash = computeImportContentHash(parsedPage);
+  if (opts.createOnly && opts.exactMerge) {
+    throw new Error('[import] createOnly and exactMerge are mutually exclusive');
+  }
+  if (opts.exactMerge && hash !== opts.exactMerge.expectedPostimageContentHash) {
+    throw new Error(`[import] exact merge postimage hash mismatch for ${sourceId ?? 'default'}/${slug}`);
+  }
 
   const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
   if (opts.createOnly && existing) {
     throw new Error(`[import] create-only page already exists: ${sourceId ?? 'default'}/${slug}`);
   }
-  if (existing?.content_hash === hash && !opts.forceRechunk) {
+  if (!opts.exactMerge && existing?.content_hash === hash && !opts.forceRechunk) {
     return { slug, status: 'skipped', chunks: 0, parsedPage };
   }
 
@@ -604,7 +621,7 @@ export async function importFromContent(
   // via the `?.` shape — no failure mode for fake engines.
   const fmId = (parsed.frontmatter as Record<string, unknown> | undefined)?.id;
   const fmIdStr = typeof fmId === 'string' && fmId.length > 0 ? fmId : null;
-  if (!opts.forceRechunk && engine.findDuplicatePage) {
+  if (!opts.exactMerge && !opts.forceRechunk && engine.findDuplicatePage) {
     let dup: { slug: string; id: number } | null = null;
     try {
       dup = await engine.findDuplicatePage(sourceId ?? 'default', {
@@ -747,7 +764,36 @@ export async function importFromContent(
   // for single-source callers.
   const txOpts = sourceId ? { sourceId } : undefined;
   await engine.transaction(async (tx) => {
-    if (existing) await tx.createVersion(slug, txOpts);
+    let preimageCreatedAt = existing?.created_at;
+    let preimageUpdatedAt = existing?.updated_at;
+    if (opts.exactMerge) {
+      const locked = await tx.executeRaw<{
+        id: number | string;
+        source_id: string;
+        slug: string;
+        content_hash: string;
+        created_at: Date | string;
+        updated_at: Date | string;
+        deleted_at: Date | string | null;
+      }>(`
+        SELECT id, source_id, slug, content_hash, created_at, updated_at, deleted_at
+          FROM pages
+         WHERE source_id = $1 AND slug = $2
+         FOR UPDATE
+      `, [sourceId ?? 'default', slug]);
+      if (locked.length !== 1 || locked[0].source_id !== (sourceId ?? 'default')
+        || locked[0].slug !== slug || locked[0].deleted_at !== null) {
+        throw new Error(`[import] exact merge requires one active preimage: ${sourceId ?? 'default'}/${slug}`);
+      }
+      if (locked[0].content_hash !== opts.exactMerge.expectedPreimageContentHash) {
+        throw new Error(`[import] exact merge preimage hash drift for ${sourceId ?? 'default'}/${slug}`);
+      }
+      preimageCreatedAt = new Date(locked[0].created_at);
+      preimageUpdatedAt = new Date(locked[0].updated_at);
+      await tx.createVersion(slug, txOpts);
+    } else if (existing) {
+      await tx.createVersion(slug, txOpts);
+    }
 
     // v0.29.1 — compute effective_date from frontmatter precedence chain.
     // Filename comes from importFromFile path (basename) or the slug tail
@@ -762,8 +808,8 @@ export async function importFromContent(
       slug,
       frontmatter: parsed.frontmatter,
       filename: filenameForChain,
-      updatedAt: existing?.updated_at ?? nowDate,
-      createdAt: existing?.created_at ?? nowDate,
+      updatedAt: preimageUpdatedAt ?? nowDate,
+      createdAt: preimageCreatedAt ?? nowDate,
     });
 
     const pageInput = {
@@ -817,7 +863,12 @@ export async function importFromContent(
       ]);
       if (created.length !== 1) throw new Error(`[import] create-only insert failed: ${sourceId ?? 'default'}/${slug}`);
     } else {
-      await tx.putPage(slug, pageInput, txOpts);
+      const written = await tx.putPage(slug, pageInput, txOpts);
+      if (opts.exactMerge && (written.source_id !== (sourceId ?? 'default')
+        || written.slug !== slug
+        || written.content_hash !== opts.exactMerge.expectedPostimageContentHash)) {
+        throw new Error(`[import] exact merge write identity mismatch for ${sourceId ?? 'default'}/${slug}`);
+      }
     }
 
     // v0.40.3.0: stamp the contextual retrieval state columns alongside
@@ -860,7 +911,7 @@ export async function importFromContent(
     // Exact create treats aliases as part of the atomic page projection.
     // Normal imports retain the historical fail-soft post-commit behavior
     // below for compatibility with pre-v110 brains.
-    if (opts.createOnly) {
+    if (opts.createOnly || opts.exactMerge) {
       const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
       await tx.setPageAliases(slug, sourceId ?? 'default', aliasNorms);
     }
@@ -924,7 +975,7 @@ export async function importFromContent(
   // import. Always called (even with []) so REMOVING an alias from frontmatter
   // clears its row — the content_hash includes non-timestamp frontmatter, so
   // an alias edit changes the hash and reaches this path (not the skip branch).
-  if (!opts.createOnly) {
+  if (!opts.createOnly && !opts.exactMerge) {
     try {
       const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
       await engine.setPageAliases(slug, sourceId ?? 'default', aliasNorms);

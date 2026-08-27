@@ -4,6 +4,8 @@ import { appendFile, chmod, mkdtemp, readFile, rm, stat, symlink, truncate, writ
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { computeImportContentHash } from '../src/core/import-file.ts';
+import { parseMarkdown } from '../src/core/markdown.ts';
 import { operationsByName, type OperationContext } from '../src/core/operations.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -26,6 +28,18 @@ async function counts(): Promise<{ versions: number; chunks: number }> {
             (SELECT count(*) FROM content_chunks) AS chunks`,
   );
   return { versions: Number(row.versions), chunks: Number(row.chunks) };
+}
+
+function canonicalPostimageHash(slug: string, content: string): string {
+  const parsed = parseMarkdown(content, `${slug}.md`);
+  return computeImportContentHash({
+    type: parsed.type,
+    title: parsed.title,
+    compiled_truth: parsed.compiled_truth,
+    timeline: parsed.timeline || '',
+    frontmatter: parsed.frontmatter,
+    tags: parsed.tags,
+  });
 }
 
 beforeAll(async () => {
@@ -292,32 +306,36 @@ describe('put_page_file_exact', () => {
     const dir = await mkdtemp(join(tmpdir(), 'gbrain-exact-file-'));
     const filePath = join(dir, 'page.md');
     const marker = 'private-file-content-marker';
-    const content = `---\ntype: note\ntitle: After\ntags:\n  - exact-file\nrelated:\n  - projects/file-target\n---\n\n# After\n\n${marker}\n`;
+    const content = `---\ntype: note\ntitle: After\ntags:\n  - exact-file\naliases:\n  - Exact File Alias\nrelated:\n  - projects/file-target\n---\n\n# After\n\n${marker}\n`;
+    const fileSha = createHash('sha256').update(content).digest('hex');
+    const postimageHash = canonicalPostimageHash(before.slug, content);
+    const exactParams = {
+      slug: before.slug,
+      expected_content_hash: before.content_hash,
+      expected_content_sha256: fileSha,
+      expected_postimage_content_hash: postimageHash,
+      file_path: filePath,
+    };
 
     try {
       await writeFile(filePath, content, { mode: 0o600 });
 
       await expect(op.handler(ctx(), {
-        slug: before.slug,
-        expected_content_hash: 'stale-hash',
-        file_path: filePath,
-      })).rejects.toThrow('content hash changed');
+        ...exactParams,
+        slug: 'Projects/Exact-File',
+      })).rejects.toThrow('slug must be lowercase');
+      await expect(op.handler(ctx(), {
+        ...exactParams,
+        expected_content_hash: '0'.repeat(64),
+      })).rejects.toThrow('preimage hash drift');
       expect(await counts()).toEqual(baselineCounts);
 
       await chmod(filePath, 0o640);
-      await expect(op.handler(ctx(), {
-        slug: before.slug,
-        expected_content_hash: before.content_hash,
-        file_path: filePath,
-      })).rejects.toThrow('mode must be exactly 0600');
+      await expect(op.handler(ctx(), exactParams)).rejects.toThrow('mode must be exactly 0600');
       expect(await counts()).toEqual(baselineCounts);
 
       await chmod(filePath, 0o600);
-      const result = await op.handler(ctx(), {
-        slug: before.slug,
-        expected_content_hash: before.content_hash,
-        file_path: filePath,
-      }) as { status: string; slug: string; content_hash: string };
+      const result = await op.handler(ctx(), exactParams) as { status: string; slug: string; content_hash: string };
       const after = (await engine.getPage(before.slug))!;
       const afterCounts = await counts();
       const tags = await engine.getTags(before.slug, { sourceId: 'default' });
@@ -339,6 +357,9 @@ describe('put_page_file_exact', () => {
       expect(afterCounts.chunks).toBeGreaterThan(0);
       expect(tags).toContain('exact-file');
       expect(links.some((link) => link.to_slug === 'projects/file-target')).toBe(true);
+      expect(await engine.executeRaw(
+        `SELECT alias_norm FROM page_aliases WHERE source_id = 'default' AND slug = $1`, [before.slug],
+      )).toEqual([{ alias_norm: 'exact file alias' }]);
       expect(provenance[0]).toEqual({ source_kind: null, source_uri: null, ingested_via: null });
       expect(result).toEqual({ status: 'written', slug: before.slug!, content_hash: after.content_hash! });
       expect(JSON.stringify(result)).not.toContain(marker);
@@ -359,14 +380,19 @@ describe('put_page_file_exact', () => {
     const dir = await mkdtemp(join(tmpdir(), 'gbrain-exact-validation-'));
     const filePath = join(dir, 'page.md');
     const symlinkPath = join(dir, 'page-link.md');
+    const validContent = '---\ntype: note\ntitle: Valid draft\n---\n\nValid body.\n';
+    const fileSha = createHash('sha256').update(validContent).digest('hex');
+    const postimageHash = canonicalPostimageHash(before.slug, validContent);
 
     const params = (path: string) => ({
       slug: before.slug,
       expected_content_hash: before.content_hash,
+      expected_content_sha256: fileSha,
+      expected_postimage_content_hash: postimageHash,
       file_path: path,
     });
     try {
-      await writeFile(filePath, 'valid', { mode: 0o600 });
+      await writeFile(filePath, validContent, { mode: 0o600 });
       await expect(op.handler({ ...ctx(), remote: true }, params(filePath))).rejects.toThrow('local-only');
       await expect(op.handler(ctx(), params('relative.md'))).rejects.toThrow('must be absolute');
       await expect(op.handler(ctx(), params(dir))).rejects.toThrow('regular file');
@@ -388,6 +414,87 @@ describe('put_page_file_exact', () => {
       await rm(dir, { recursive: true, force: true });
     }
   }, 60_000);
+
+  test('rejects unapproved file bytes and canonical postimages before any write', async () => {
+    const op = operationsByName.put_page_file_exact;
+    await engine.putPage('projects/exact-draft-gates', {
+      type: 'note', title: 'Baseline', compiled_truth: 'baseline', timeline: '', frontmatter: {},
+    });
+    const before = (await engine.getPage('projects/exact-draft-gates'))!;
+    const baselineCounts = await counts();
+    const dir = await mkdtemp(join(tmpdir(), 'gbrain-exact-draft-gates-'));
+    const filePath = join(dir, 'draft.md');
+    const content = '---\ntype: note\ntitle: Approved draft\n---\n\nApproved body.\n';
+    const fileSha = createHash('sha256').update(content).digest('hex');
+    const postimageHash = canonicalPostimageHash(before.slug, content);
+    const params = {
+      slug: before.slug,
+      expected_content_hash: before.content_hash,
+      expected_content_sha256: fileSha,
+      expected_postimage_content_hash: postimageHash,
+      file_path: filePath,
+    };
+    try {
+      await writeFile(filePath, content, { mode: 0o600 });
+      await expect(op.handler(ctx(), {
+        ...params, expected_content_sha256: '0'.repeat(64),
+      })).rejects.toThrow('file sha256 changed');
+      await expect(op.handler(ctx(), {
+        ...params, expected_postimage_content_hash: '0'.repeat(64),
+      })).rejects.toThrow('postimage hash mismatch');
+      const after = (await engine.getPage(before.slug))!;
+      expect(after.content_hash).toBe(before.content_hash);
+      expect(after.title).toBe('Baseline');
+      expect(await counts()).toEqual(baselineCounts);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('rechecks the preimage under lock and never writes a draft that lost the CAS race', async () => {
+    const op = operationsByName.put_page_file_exact;
+    await engine.putPage('projects/exact-preimage-race', {
+      type: 'note', title: 'Initial', compiled_truth: 'initial body', timeline: '', frontmatter: {},
+    });
+    const before = (await engine.getPage('projects/exact-preimage-race'))!;
+    const baselineCounts = await counts();
+    const dir = await mkdtemp(join(tmpdir(), 'gbrain-exact-preimage-race-'));
+    const filePath = join(dir, 'approved.md');
+    const marker = 'approved-draft-must-not-land';
+    const content = `---\ntype: note\ntitle: Approved\naliases:\n  - Must Not Land\n---\n\n${marker}\n`;
+    const originalTransaction = engine.transaction;
+    let injected = false;
+    try {
+      await writeFile(filePath, content, { mode: 0o600 });
+      engine.transaction = async function <T>(fn: (tx: import('../src/core/engine.ts').BrainEngine) => Promise<T>): Promise<T> {
+        if (!injected) {
+          injected = true;
+          await engine.putPage(before.slug, {
+            type: 'note', title: 'Concurrent winner', compiled_truth: 'concurrent body', timeline: '', frontmatter: {},
+          });
+        }
+        return originalTransaction.call(engine, fn) as Promise<T>;
+      };
+      await expect(op.handler(ctx(), {
+        slug: before.slug,
+        expected_content_hash: before.content_hash,
+        expected_content_sha256: createHash('sha256').update(content).digest('hex'),
+        expected_postimage_content_hash: canonicalPostimageHash(before.slug, content),
+        file_path: filePath,
+      })).rejects.toThrow('preimage hash drift');
+      const after = (await engine.getPage(before.slug))!;
+      expect(after.title).toBe('Concurrent winner');
+      expect(after.compiled_truth).toBe('concurrent body');
+      expect(after.compiled_truth).not.toContain(marker);
+      expect((await counts()).versions).toBe(baselineCounts.versions);
+      expect(await engine.executeRaw(
+        `SELECT alias_norm FROM page_aliases WHERE source_id = 'default' AND slug = $1`, [before.slug],
+      )).toEqual([]);
+    } finally {
+      engine.transaction = originalTransaction;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('exact corpus page operations', () => {
@@ -398,6 +505,11 @@ describe('exact corpus page operations', () => {
     const remote = { ...ctx(), engine: explodingEngine, remote: true };
     const cases: Array<[string, Record<string, unknown>]> = [
       ['create_page_file_exact', { slug: 'projects/new', expected_content_sha256: 'a'.repeat(64), file_path: '/tmp/nope' }],
+      ['put_page_file_exact', {
+        slug: 'projects/existing', expected_content_hash: 'a'.repeat(64),
+        expected_content_sha256: 'b'.repeat(64), expected_postimage_content_hash: 'c'.repeat(64),
+        file_path: '/tmp/nope',
+      }],
       ['soft_delete_page_exact', { slug: 'projects/old', expected_content_hash: 'a'.repeat(64) }],
       ['restore_page_exact', { slug: 'projects/old', expected_content_hash: 'a'.repeat(64), expected_deleted_at: new Date().toISOString() }],
       ['purge_pages_exact', { action: 'plan', run_id: 'remote-test', allowlist: [] }],

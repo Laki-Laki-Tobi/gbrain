@@ -151,6 +151,7 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
       'file_list',
       'file_url',
       'create_page_file_exact',
+      'put_page_file_exact',
       'soft_delete_page_exact',
       'restore_page_exact',
       'purge_pages_exact',

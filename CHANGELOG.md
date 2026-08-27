@@ -2,6 +2,20 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.7] - 2026-08-28
+
+### Fixed
+- `put_page_file_exact` now requires exact preimage, private-file SHA-256,
+  and canonical postimage hashes. The canonical importer locks and rechecks
+  the active source/slug preimage inside its write transaction before creating
+  a version or changing the page graph, so a concurrent edit cannot be
+  overwritten by an already-reviewed draft.
+- Exact merge aliases are now projected in the same transaction as the page,
+  tags, chunks, and version while the normal `put_page` post-write behavior is
+  preserved through a module-private local-only gate.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.6] - 2026-08-28
 
 ### Fixed

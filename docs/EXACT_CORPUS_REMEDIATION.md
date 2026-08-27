@@ -13,6 +13,14 @@ through the local `gbrain call` surface with an explicit source selection.
   constraint atomically rejects a concurrent creator instead of entering an
   upsert path. The resulting page, tags, aliases, and content hash are read
   back exactly.
+- `put_page_file_exact` merges an approved private-file draft into one active
+  lowercase source/slug. `expected_content_hash` binds the active preimage,
+  `expected_content_sha256` binds the file bytes, and
+  `expected_postimage_content_hash` binds the canonical parsed postimage. The
+  importer locks and rechecks the preimage inside the write transaction before
+  version, page, tag, alias, or chunk writes. Alias projection is exact and
+  transactional; normal local `put_page` reconciliation hooks still run after
+  commit.
 - `soft_delete_page_exact` binds the mutation to source, slug, and
   `expected_content_hash`. Set `require_zero_inbound=true` to block while any
   database backlink exists. Endpoint row locks serialize this gate with both
