@@ -1167,7 +1167,11 @@ export interface BrainEngine {
    * Callers MUST NOT wrap externally; see {@link BatchOpts} retry contract.
    */
   addLinksBatch(links: LinkBatchInput[], opts?: BatchOpts): Promise<number>;
-  /** Local-admin rollback primitive. Restores one exact edge without rewriting provenance. */
+  /**
+   * Local-admin rollback primitive. Restores one exact edge without rewriting
+   * provenance. Canonical implementations transactionally lock every endpoint,
+   * including soft-deleted rows, to serialize with exact zero-inbound deletion.
+   */
   restoreLinkExact(edge: ExactLinkIdentity, opts?: { sourceId?: string }): Promise<void>;
   /**
    * Remove links from `from` to `to`. If linkType is provided, only that specific

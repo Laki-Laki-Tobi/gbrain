@@ -5,12 +5,12 @@ import path from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import type { BrainEngine } from './engine.ts';
 
-const POLICY_VERSION = 'gbrain-exact-corpus-remediation-v2-2026-08-28';
-const BACKUP_SCHEMA = 'gbrain-purge-pages-exact-backup-v2';
-const PLAN_SCHEMA = 'gbrain-purge-pages-exact-plan-v2';
-const APPLY_SCHEMA = 'gbrain-purge-pages-exact-apply-v2';
-const VERIFY_SCHEMA = 'gbrain-purge-pages-exact-verify-v2';
-const ROLLBACK_SCHEMA = 'gbrain-purge-pages-exact-rollback-v2';
+const POLICY_VERSION = 'gbrain-exact-corpus-remediation-v3-2026-08-28';
+const BACKUP_SCHEMA = 'gbrain-purge-pages-exact-backup-v3';
+const PLAN_SCHEMA = 'gbrain-purge-pages-exact-plan-v3';
+const APPLY_SCHEMA = 'gbrain-purge-pages-exact-apply-v3';
+const VERIFY_SCHEMA = 'gbrain-purge-pages-exact-verify-v3';
+const ROLLBACK_SCHEMA = 'gbrain-purge-pages-exact-rollback-v3';
 const MINIMUM_DELETED_AGE_DAYS = 3;
 const MAX_BACKUP_BYTES = 64 * 1024 * 1024;
 
@@ -59,6 +59,7 @@ interface PurgeGraph {
   files: JsonRow[];
   page_aliases: JsonRow[];
   slug_aliases: JsonRow[];
+  preserved_slug_redirects: JsonRow[];
 }
 
 const EMPTY_GRAPH = (): PurgeGraph => ({
@@ -77,6 +78,7 @@ const EMPTY_GRAPH = (): PurgeGraph => ({
   files: [],
   page_aliases: [],
   slug_aliases: [],
+  preserved_slug_redirects: [],
 });
 
 function nowIso(): string {
@@ -341,10 +343,31 @@ async function captureGraph(engine: BrainEngine, pages: JsonRow[]): Promise<Purg
     SELECT to_jsonb(a) AS row_json FROM page_aliases a
      WHERE a.source_id = $1 AND a.slug = ANY($2::text[]) ORDER BY a.id
   `, [sourceIds[0], slugs]);
+  graph.preserved_slug_redirects = await optionalJsonRows(engine, 'slug_aliases', `
+    SELECT to_jsonb(a) AS row_json FROM slug_aliases a
+     WHERE a.source_id = $1
+       AND a.alias_slug = ANY($2::text[])
+       AND EXISTS (
+         SELECT 1 FROM pages canonical
+          WHERE canonical.source_id = a.source_id
+            AND canonical.slug = a.canonical_slug
+            AND canonical.deleted_at IS NULL
+       )
+     ORDER BY a.alias_slug
+  `, [sourceIds[0], slugs]);
   graph.slug_aliases = await optionalJsonRows(engine, 'slug_aliases', `
     SELECT to_jsonb(a) AS row_json FROM slug_aliases a
      WHERE a.source_id = $1
        AND (a.alias_slug = ANY($2::text[]) OR a.canonical_slug = ANY($2::text[]))
+       AND NOT (
+         a.alias_slug = ANY($2::text[])
+         AND EXISTS (
+           SELECT 1 FROM pages canonical
+            WHERE canonical.source_id = a.source_id
+              AND canonical.slug = a.canonical_slug
+              AND canonical.deleted_at IS NULL
+         )
+       )
      ORDER BY a.alias_slug
   `, [sourceIds[0], slugs]);
   return graph;
@@ -429,6 +452,7 @@ async function activeDependencyCounts(
     ? await countQuery(engine, `
         SELECT count(*)::bigint AS count FROM slug_aliases
          WHERE source_id = $1 AND canonical_slug = ANY($2::text[])
+           AND NOT (alias_slug = ANY($2::text[]))
       `, [sourceId, slugs])
     : 0;
   return {
@@ -595,11 +619,45 @@ interface PurgeGraphVerification {
   set_null_expected_count: number;
   set_null_verified_count: number;
   set_null_drift_count: number;
+  preserved_redirect_expected_count: number;
+  preserved_redirect_verified_count: number;
+  preserved_redirect_drift_count: number;
+}
+
+async function verifyPreservedSlugRedirects(
+  engine: BrainEngine,
+  backup: PurgeBackup,
+): Promise<{ expected: number; verified: number; drift: number }> {
+  const expectedRows = backup.rows.preserved_slug_redirects;
+  if (expectedRows.length === 0) return { expected: 0, verified: 0, drift: 0 };
+  const aliases = expectedRows.map((row) => String(row.alias_slug));
+  const current = await optionalJsonRows(engine, 'slug_aliases', `
+    SELECT to_jsonb(a) AS row_json
+      FROM slug_aliases a
+      JOIN pages canonical
+        ON canonical.source_id = a.source_id
+       AND canonical.slug = a.canonical_slug
+       AND canonical.deleted_at IS NULL
+     WHERE a.source_id = $1 AND a.alias_slug = ANY($2::text[])
+     ORDER BY a.alias_slug
+  `, [backup.source_id, aliases]);
+  const currentByAlias = new Map(current.map((row) => [String(row.alias_slug), row]));
+  const verified = expectedRows.filter((row) =>
+    stableJson(currentByAlias.get(String(row.alias_slug))) === stableJson(row)).length;
+  return { expected: expectedRows.length, verified, drift: expectedRows.length - verified };
+}
+
+async function assertPreservedSlugRedirects(engine: BrainEngine, backup: PurgeBackup): Promise<void> {
+  const result = await verifyPreservedSlugRedirects(engine, backup);
+  if (result.drift !== 0) {
+    throw new Error('preserved slug redirect drifted from purge backup');
+  }
 }
 
 async function verifyPurgedGraph(engine: BrainEngine, backup: PurgeBackup): Promise<PurgeGraphVerification> {
   const pageIds = numericIds(backup.rows.pages);
   const slugs = backup.rows.pages.map((page) => String(page.slug));
+  const preservedAliases = backup.rows.preserved_slug_redirects.map((row) => String(row.alias_slug));
   const chunkIds = numericIds(backup.rows.content_chunks);
   const residualCounts: Record<string, number> = {
     pages_by_id: (await pagesByIds(engine, pageIds)).length,
@@ -642,9 +700,10 @@ async function verifyPurgedGraph(engine: BrainEngine, backup: PurgeBackup): Prom
     ),
     slug_aliases: await optionalResidualCount(
       engine, 'slug_aliases',
-      `SELECT count(*)::bigint AS count FROM slug_aliases WHERE source_id = $1
-        AND (alias_slug = ANY($2::text[]) OR canonical_slug = ANY($2::text[]))`,
-      [backup.source_id, slugs], backup.rows.slug_aliases.length,
+      `SELECT count(*)::bigint AS count FROM slug_aliases a WHERE source_id = $1
+        AND (alias_slug = ANY($2::text[]) OR canonical_slug = ANY($2::text[]))
+        AND NOT (alias_slug = ANY($3::text[]))`,
+      [backup.source_id, slugs, preservedAliases], backup.rows.slug_aliases.length,
     ),
   };
 
@@ -671,13 +730,17 @@ async function verifyPurgedGraph(engine: BrainEngine, backup: PurgeBackup): Prom
     }
   }
   const residualRowCount = Object.values(residualCounts).reduce((sum, count) => sum + count, 0);
+  const preservedRedirects = await verifyPreservedSlugRedirects(engine, backup);
   return {
-    status: residualRowCount === 0 && setNullDrift === 0 ? 'pass' : 'blocked',
+    status: residualRowCount === 0 && setNullDrift === 0 && preservedRedirects.drift === 0 ? 'pass' : 'blocked',
     residual_counts: residualCounts,
     residual_row_count: residualRowCount,
     set_null_expected_count: backup.rows.files.length + backup.rows.origin_only_links.length,
     set_null_verified_count: setNullVerified,
     set_null_drift_count: setNullDrift,
+    preserved_redirect_expected_count: preservedRedirects.expected,
+    preserved_redirect_verified_count: preservedRedirects.verified,
+    preserved_redirect_drift_count: preservedRedirects.drift,
   };
 }
 
@@ -787,9 +850,16 @@ async function apply(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Re
       if (await tableExists(tx, 'page_aliases')) {
         await tx.executeRaw(`DELETE FROM page_aliases WHERE source_id = $1 AND slug = ANY($2::text[])`, [args.sourceId, slugs]);
       }
-      if (await tableExists(tx, 'slug_aliases')) {
-        await tx.executeRaw(`DELETE FROM slug_aliases WHERE source_id = $1
-          AND (alias_slug = ANY($2::text[]) OR canonical_slug = ANY($2::text[]))`, [args.sourceId, slugs]);
+      const destructiveSlugAliasIds = numericIds(backup.rows.slug_aliases);
+      if (destructiveSlugAliasIds.length > 0 && await tableExists(tx, 'slug_aliases')) {
+        const deletedAliases = await tx.executeRaw<{ id: number | string }>(`
+          DELETE FROM slug_aliases
+           WHERE source_id = $1 AND id = ANY($2::bigint[])
+           RETURNING id
+        `, [args.sourceId, destructiveSlugAliasIds]);
+        if (deletedAliases.length !== destructiveSlugAliasIds.length) {
+          throw new Error('purge slug redirect graph drifted during delete');
+        }
       }
       for (const page of backup.rows.pages) {
         const deleted = await tx.executeRaw<{ id: number | string }>(`
@@ -904,6 +974,7 @@ async function restoreSetNullRows(engine: BrainEngine, backup: PurgeBackup): Pro
 }
 
 async function restoreGraph(engine: BrainEngine, backup: PurgeBackup): Promise<void> {
+  await assertPreservedSlugRedirects(engine, backup);
   await insertRows(engine, 'pages', backup.rows.pages);
   for (const page of backup.rows.pages) {
     await engine.executeRaw(`UPDATE pages SET generation = $1::bigint WHERE id = $2::int`, [page.generation, Number(page.id)]);

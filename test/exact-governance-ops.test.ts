@@ -598,6 +598,40 @@ describe('exact corpus page operations', () => {
     if (after?.deleted_at) expect(Number(links[0].count)).toBe(0);
     else expect(Number(links[0].count)).toBe(1);
   });
+
+  test('zero-inbound soft-delete serializes with exact rollback link restore across deleted endpoints', async () => {
+    await engine.putPage('projects/restore-race-target', {
+      type: 'note', title: 'Restore race target', compiled_truth: 'target', timeline: '', frontmatter: {},
+    });
+    await engine.putPage('projects/restore-race-referrer', {
+      type: 'note', title: 'Restore race referrer', compiled_truth: 'referrer', timeline: '', frontmatter: {},
+    });
+    await engine.softDeletePage('projects/restore-race-referrer');
+    const target = (await engine.getPage('projects/restore-race-target'))!;
+    const edge = {
+      from_slug: 'projects/restore-race-referrer',
+      to_slug: target.slug,
+      link_type: 'related',
+      context: 'rollback restore race',
+      link_source: 'manual',
+      origin_slug: null,
+      origin_field: null,
+      resolution_type: null,
+    };
+    const restore = engine.restoreLinkExact(edge, { sourceId: 'default' });
+    const deletion = operationsByName.soft_delete_page_exact.handler(ctx(), {
+      slug: target.slug, expected_content_hash: target.content_hash, require_zero_inbound: true,
+    });
+    const outcomes = await Promise.allSettled([restore, deletion]);
+    expect(outcomes[0].status).toBe('fulfilled');
+    expect(outcomes[1].status).toBe('rejected');
+    if (outcomes[1].status === 'rejected') {
+      expect(String(outcomes[1].reason)).toContain('zero-inbound gate failed');
+    }
+    expect((await engine.getPage(target.slug, { includeDeleted: true }))?.deleted_at).toBeNull();
+    const links = await engine.getLinks(edge.from_slug, { includeDeleted: true });
+    expect(links.some((link) => link.to_slug === target.slug && link.context === edge.context)).toBe(true);
+  });
 });
 
 describe('purge_pages_exact', () => {
@@ -689,6 +723,78 @@ describe('purge_pages_exact', () => {
       await rm(home, { recursive: true, force: true });
     }
   });
+
+  test('blocks a surviving redirect whose canonical slug is a purge target', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const page = await seedPurgePage('archive/canonical-target', 'canonical target', 10);
+    await engine.executeRaw(
+      `INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug, notes)
+       VALUES ('default', 'archive/surviving-alias', $1, 'must survive')`,
+      [page.slug],
+    );
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-purge-canonical-alias-home-'));
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        await expect(op.handler(ctx(), {
+          action: 'plan', run_id: 'canonical-alias-gate', allowlist: [entry(page)],
+        })).rejects.toThrow('active dependency gate failed');
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test('preserves an alias-page redirect to a live canonical page through apply, verify, and rollback', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const aliasPage = await seedPurgePage('archive/durable-alias-page', 'obsolete redirect page', 10);
+    await engine.putPage('projects/live-canonical-page', {
+      type: 'note', title: 'Live canonical page', compiled_truth: 'canonical', timeline: '', frontmatter: {},
+    });
+    await engine.executeRaw(
+      `INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug, notes)
+       VALUES ('default', $1, 'projects/live-canonical-page', 'durable replacement')`,
+      [aliasPage.slug],
+    );
+    const [redirectBefore] = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT * FROM slug_aliases WHERE source_id = 'default' AND alias_slug = $1`, [aliasPage.slug],
+    );
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-purge-preserved-redirect-home-'));
+    const params = { action: 'plan', run_id: 'preserved-slug-redirect', allowlist: [entry(aliasPage)] };
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        const plan = await op.handler(ctx(), params) as any;
+        expect(plan.backup_row_counts.preserved_slug_redirects).toBe(1);
+        expect(plan.backup_row_counts.slug_aliases).toBe(0);
+
+        await op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        });
+        expect(await engine.getPage(aliasPage.slug, { includeDeleted: true })).toBeNull();
+        expect(await engine.resolveSlugWithAlias(aliasPage.slug, 'default'))
+          .toBe('projects/live-canonical-page');
+        const [redirectAfterApply] = await engine.executeRaw<Record<string, unknown>>(
+          `SELECT * FROM slug_aliases WHERE source_id = 'default' AND alias_slug = $1`, [aliasPage.slug],
+        );
+        expect(redirectAfterApply).toEqual(redirectBefore);
+        const verified = await op.handler(ctx(), { ...params, action: 'verify' }) as any;
+        expect(verified.preserved_redirect_expected_count).toBe(1);
+        expect(verified.preserved_redirect_verified_count).toBe(1);
+        expect(verified.preserved_redirect_drift_count).toBe(0);
+
+        await op.handler(ctx(), {
+          ...params, action: 'rollback', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        });
+        const [redirectAfterRollback] = await engine.executeRaw<Record<string, unknown>>(
+          `SELECT * FROM slug_aliases WHERE source_id = 'default' AND alias_slug = $1`, [aliasPage.slug],
+        );
+        expect(redirectAfterRollback).toEqual(redirectBefore);
+        expect((await engine.getPage(aliasPage.slug, { includeDeleted: true }))?.content_hash)
+          .toBe(aliasPage.content_hash);
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   test('verify fails closed when an expected SET NULL dependency drifts after apply', async () => {
     const op = operationsByName.purge_pages_exact;

@@ -20,6 +20,9 @@ through the local `gbrain call` surface with an explicit source selection.
 - `restore_page_exact` additionally requires the exact tombstone timestamp in
   `expected_deleted_at`. It verifies the restored active row after clearing
   the tombstone.
+- `restore_link_exact` locks all exact endpoint rows in its write transaction,
+  including deleted endpoints used during rollback. It therefore serializes
+  with `soft_delete_page_exact`'s zero-inbound gate before restoring provenance.
 
 Ambiguous create, soft-delete, or restore recovery is fail-closed. Set
 `accept_ambiguous_commit=true` only after independently reviewing the current
@@ -48,6 +51,13 @@ origin-only links, tags, raw data, timeline entries, versions, takes,
 synthesis evidence, file associations, and page/slug aliases. Files and
 origin-only links that survive the purge through `ON DELETE SET NULL` are
 drift-checked before rollback restores their associations.
+
+A `slug_aliases` row whose `alias_slug` is the purged page slug and whose
+`canonical_slug` names a live page is the durable replacement for that page,
+so apply preserves it. The backup records this preserved projection and both
+verify and rollback require it to remain exact. Conversely, a surviving alias
+whose `canonical_slug` is a purge target remains an active dependency and
+blocks the purge.
 
 Plan capture uses one transaction (`REPEATABLE READ` on Postgres), and apply
 uses a serializable transaction plus target row locks and an exact graph

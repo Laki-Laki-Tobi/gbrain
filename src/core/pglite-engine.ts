@@ -2572,6 +2572,28 @@ export class PGLiteEngine implements BrainEngine {
     }
   }
 
+  private async lockLinkEndpointsIncludingDeleted(
+    endpoints: Array<{ source_id: string; slug: string }>,
+  ): Promise<void> {
+    const unique = [...new Map(endpoints.map((endpoint) => [
+      `${endpoint.source_id}\0${endpoint.slug}`, endpoint,
+    ])).values()].sort((left, right) =>
+      left.source_id.localeCompare(right.source_id) || left.slug.localeCompare(right.slug));
+    const locked = await executeRawJsonb<{ id: number | string }>(
+      this,
+      `SELECT p.id
+         FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(source_id text, slug text)
+         JOIN pages p ON p.source_id = v.source_id AND p.slug = v.slug
+        ORDER BY p.source_id, p.slug
+        FOR KEY SHARE OF p`,
+      [],
+      [{ rows: unique }],
+    );
+    if (locked.length !== unique.length) {
+      throw new Error('restoreLinkExact failed: one or more endpoints were not found');
+    }
+  }
+
   async addLink(
     from: string,
     to: string,
@@ -2665,33 +2687,34 @@ export class PGLiteEngine implements BrainEngine {
     if (context !== edge.context) {
       throw new Error('restoreLinkExact failed: context contains unsupported characters');
     }
-    const slugs = [edge.from_slug, edge.to_slug, edge.origin_slug]
-      .filter((value): value is string => value !== null);
-    for (const slug of slugs) {
-      const page = await this.getPage(slug, { sourceId, includeDeleted: true });
-      if (!page) throw new Error(`restoreLinkExact failed: page "${slug}" (source=${sourceId}) not found`);
-    }
-
-    await this.db.query(
-      `INSERT INTO links (
-         from_page_id, to_page_id, link_type, context, link_source,
-         origin_page_id, origin_field, resolution_type
-       )
-       SELECT f.id, t.id, $1, $2, $3, o.id, $4, $5
-       FROM pages f
-       JOIN pages t ON t.slug = $6 AND t.source_id = $7
-       LEFT JOIN pages o ON o.slug = $8 AND o.source_id = $7
-       WHERE f.slug = $9 AND f.source_id = $7
-       ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id)
-       DO UPDATE SET
-         context = EXCLUDED.context,
-         origin_field = EXCLUDED.origin_field,
-         resolution_type = EXCLUDED.resolution_type`,
-      [
-        edge.link_type, context, edge.link_source, edge.origin_field,
-        edge.resolution_type, edge.to_slug, sourceId, edge.origin_slug, edge.from_slug,
-      ],
-    );
+    const endpoints = [edge.from_slug, edge.to_slug, edge.origin_slug]
+      .filter((value): value is string => value !== null)
+      .map((slug) => ({ source_id: sourceId, slug }));
+    await this.withLinkWriteTransaction(async (tx) => {
+      await tx.lockLinkEndpointsIncludingDeleted(endpoints);
+      const inserted = await tx.db.query<{ id: number | string }>(
+        `INSERT INTO links (
+           from_page_id, to_page_id, link_type, context, link_source,
+           origin_page_id, origin_field, resolution_type
+         )
+         SELECT f.id, t.id, $1, $2, $3, o.id, $4, $5
+         FROM pages f
+         JOIN pages t ON t.slug = $6 AND t.source_id = $7
+         LEFT JOIN pages o ON o.slug = $8 AND o.source_id = $7
+         WHERE f.slug = $9 AND f.source_id = $7
+         ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id)
+         DO UPDATE SET
+           context = EXCLUDED.context,
+           origin_field = EXCLUDED.origin_field,
+           resolution_type = EXCLUDED.resolution_type
+         RETURNING id`,
+        [
+          edge.link_type, context, edge.link_source, edge.origin_field,
+          edge.resolution_type, edge.to_slug, sourceId, edge.origin_slug, edge.from_slug,
+        ],
+      );
+      if (inserted.rows.length !== 1) throw new Error('restoreLinkExact failed: endpoint identity changed');
+    });
   }
 
   async removeLink(

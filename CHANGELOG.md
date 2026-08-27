@@ -2,6 +2,19 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.6] - 2026-08-28
+
+### Fixed
+- Exact rollback link restore now takes the canonical transaction-scoped
+  endpoint locks, including deleted endpoints, so it serializes with exact
+  zero-inbound soft-delete.
+- Exact purge preserves a purged alias slug's durable redirect to a live
+  canonical page while continuing to block surviving aliases that point at a
+  canonical purge target. Backup, verify, and rollback now attest that
+  preserved redirect projection explicitly.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.5] - 2026-08-28
 
 ### Fixed
