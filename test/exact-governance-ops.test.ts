@@ -1,9 +1,10 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import { chmod, mkdtemp, rm, symlink, truncate, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, stat, symlink, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operationsByName, type OperationContext } from '../src/core/operations.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 
@@ -142,6 +143,134 @@ describe('patch_page_metadata_exact', () => {
     expect(after.updated_at.getTime()).toBe(before.updated_at.getTime());
     expect(await counts()).toEqual(baselineCounts);
   });
+});
+
+describe('page_version_retention_exact', () => {
+  test('plans, applies, verifies, and rolls back a bounded source-scoped batch', async () => {
+    const op = operationsByName.page_version_retention_exact;
+    expect(op.localOnly).toBe(true);
+    expect(op.scope).toBe('admin');
+    expect(op.mutating).toBe(true);
+
+    await engine.putPage('projects/version-retention', {
+      type: 'note', title: 'Version retention', compiled_truth: 'current body', timeline: '', frontmatter: {},
+    });
+    const [page] = await engine.executeRaw<{ id: number | string }>(
+      `SELECT id FROM pages WHERE source_id = $1 AND slug = $2`,
+      ['default', 'projects/version-retention'],
+    );
+    for (let index = 0; index < 5; index += 1) {
+      await engine.executeRaw(`
+        INSERT INTO page_versions (page_id, compiled_truth, frontmatter, snapshot_at)
+        VALUES ($1::int, $2::text, $3::jsonb, now() - ($4::int * interval '1 day'))
+      `, [Number(page.id), `private-version-${index}`, JSON.stringify({ index }), 30 + index]);
+    }
+
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-retention-home-'));
+    const params = {
+      action: 'plan', run_id: 'retention-test', retention_days: 7,
+      keep_latest: 2, delete_limit: 5000, max_payload_bytes: 1024 * 1024,
+    };
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        await expect(op.handler({ ...ctx(), remote: true }, params)).rejects.toThrow('local-only');
+        const plan = await op.handler(ctx(), params) as any;
+        expect(plan.status).toBe('pass');
+        expect(plan.candidate_count).toBe(3);
+        expect(plan).not.toHaveProperty('candidate_ids');
+        expect(JSON.stringify(plan)).not.toContain('private-version');
+
+        const dir = join(home, 'governance-backups', 'page-versions', 'retention-test');
+        expect((await stat(join(dir, 'plan.json'))).mode & 0o777).toBe(0o600);
+        expect((await stat(join(dir, 'backup.json.gz'))).mode & 0o777).toBe(0o600);
+
+        await expect(op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.candidate_fingerprint,
+        })).rejects.toThrow('apply_enabled=true');
+        const applied = await op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.candidate_fingerprint, apply_enabled: true,
+        }) as any;
+        expect(applied.status).toBe('pass');
+        expect(applied.deleted_count).toBe(3);
+        expect((await op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.candidate_fingerprint, apply_enabled: true,
+        }) as any).deleted_count).toBe(3);
+
+        const verified = await op.handler(ctx(), { ...params, action: 'verify' }) as any;
+        expect(verified.status).toBe('pass');
+        expect(verified.remaining_count).toBe(0);
+        expect((await op.handler(ctx(), { ...params, action: 'verify' }) as any).status).toBe('pass');
+        expect((await counts()).versions).toBe(2);
+
+        const rolledBack = await op.handler(ctx(), {
+          ...params, action: 'rollback', expected_fingerprint: plan.candidate_fingerprint, apply_enabled: true,
+        }) as any;
+        expect(rolledBack.status).toBe('pass');
+        expect(rolledBack.restored_count).toBe(3);
+        expect((await counts()).versions).toBe(5);
+        expect((await op.handler(ctx(), {
+          ...params, action: 'rollback', expected_fingerprint: plan.candidate_fingerprint, apply_enabled: true,
+        }) as any).restored_count).toBe(3);
+        await expect(op.handler(ctx(), { ...params, action: 'verify' })).rejects.toThrow('does not match database state');
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('requires an explicit gate to recover a missing apply artifact after an ambiguous commit', async () => {
+    const op = operationsByName.page_version_retention_exact;
+    await engine.putPage('projects/version-retention-recovery', {
+      type: 'note', title: 'Version retention recovery', compiled_truth: 'current body', timeline: '', frontmatter: {},
+    });
+    const [page] = await engine.executeRaw<{ id: number | string }>(
+      `SELECT id FROM pages WHERE source_id = $1 AND slug = $2`,
+      ['default', 'projects/version-retention-recovery'],
+    );
+    for (let index = 0; index < 4; index += 1) {
+      await engine.executeRaw(`
+        INSERT INTO page_versions (page_id, compiled_truth, frontmatter, snapshot_at)
+        VALUES ($1::int, $2::text, $3::jsonb, now() - ($4::int * interval '1 day'))
+      `, [Number(page.id), `recovery-version-${index}`, JSON.stringify({ index }), 30 + index]);
+    }
+
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-retention-recovery-home-'));
+    const params = {
+      action: 'plan', run_id: 'retention-recovery-test', retention_days: 7,
+      keep_latest: 2, delete_limit: 5000, max_payload_bytes: 1024 * 1024,
+    };
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        const plan = await op.handler(ctx(), params) as any;
+        const planFile = join(home, 'governance-backups', 'page-versions', 'retention-recovery-test', 'plan.json');
+        const privatePlan = JSON.parse(await readFile(planFile, 'utf8'));
+        await engine.executeRaw(
+          `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+          ['retention-other'],
+        );
+        await engine.executeRaw('UPDATE pages SET source_id = $1 WHERE id = $2::int', ['retention-other', Number(page.id)]);
+        await expect(op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.candidate_fingerprint,
+          apply_enabled: true, accept_ambiguous_commit: true,
+        })).rejects.toThrow('source identity drift');
+        await engine.executeRaw('UPDATE pages SET source_id = $1 WHERE id = $2::int', ['default', Number(page.id)]);
+        await engine.executeRaw('DELETE FROM page_versions WHERE id = ANY($1::int[])', [privatePlan.candidate_ids]);
+
+        await expect(op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.candidate_fingerprint, apply_enabled: true,
+        })).rejects.toThrow('accept_ambiguous_commit=true');
+        const recovered = await op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.candidate_fingerprint,
+          apply_enabled: true, accept_ambiguous_commit: true,
+        }) as any;
+        expect(recovered.status).toBe('pass');
+        expect(recovered.recovered_after_ambiguous_commit).toBe(true);
+        expect((await op.handler(ctx(), { ...params, action: 'verify' }) as any).status).toBe('pass');
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 describe('put_page_file_exact', () => {

@@ -2,6 +2,21 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.3] - 2026-08-27
+
+### Added
+- Local-admin `page_version_retention_exact` provides source-scoped,
+  hash-gated, bounded page-version retention with private `0600` backups,
+  immutable evidence artifacts, exact readback, idempotent apply/verify,
+  operator-gated ambiguous-commit recovery, and transactional rollback.
+
+### Fixed
+- The parallel verification runner now preserves each check's real exit code
+  on macOS when GNU `timeout` is unavailable, instead of reporting the stopped
+  watchdog's `143` for every check.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.2] - 2026-08-27
 
 ### Added
