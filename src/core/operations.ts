@@ -30,6 +30,7 @@ import type { SearchResult } from './types.ts';
 import { CJK_SLUG_CHARS } from './cjk.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
+import { runPageVersionRetention } from './page-version-retention.ts';
 import {
   GET_RECENT_SALIENCE_DESCRIPTION,
   FIND_ANOMALIES_DESCRIPTION,
@@ -2348,6 +2349,61 @@ const patch_page_metadata_exact: Operation = {
       throw new OperationError('storage_error', `patch_page_metadata_exact readback mismatch for ${slug}`);
     }
     return { status: 'patched', slug, content_hash: result.content_hash, patch, unset };
+  },
+};
+
+const page_version_retention_exact: Operation = {
+  name: 'page_version_retention_exact',
+  description: 'Local-admin bounded page-version retention with a private rollback backup and exact plan fingerprint.',
+  params: {
+    action: { type: 'string', required: true, enum: ['plan', 'apply', 'verify', 'rollback'] },
+    run_id: { type: 'string', required: true },
+    retention_days: { type: 'number' },
+    keep_latest: { type: 'number' },
+    delete_limit: { type: 'number' },
+    max_payload_bytes: { type: 'number' },
+    expected_fingerprint: { type: 'string' },
+    apply_enabled: { type: 'boolean' },
+    accept_ambiguous_commit: { type: 'boolean' },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError(
+        'permission_denied',
+        'page_version_retention_exact is local-only and must be called through the local CLI.',
+      );
+    }
+    const integer = (key: string, fallback: number, min: number, max: number): number => {
+      const value = p[key] ?? fallback;
+      if (!Number.isInteger(value) || Number(value) < min || Number(value) > max) {
+        throw new OperationError('invalid_params', `${key} must be an integer between ${min} and ${max}`);
+      }
+      return Number(value);
+    };
+    const action = requireExactString(p, 'action') as 'plan' | 'apply' | 'verify' | 'rollback';
+    if (!['plan', 'apply', 'verify', 'rollback'].includes(action)) {
+      throw new OperationError('invalid_params', 'unsupported page-version retention action');
+    }
+    const runId = requireExactString(p, 'run_id');
+    try {
+      return await runPageVersionRetention(ctx.engine, {
+        action,
+        runId,
+        sourceId: ctx.sourceId || 'default',
+        retentionDays: integer('retention_days', 14, 7, 3650),
+        keepLatest: integer('keep_latest', 3, 2, 100),
+        deleteLimit: integer('delete_limit', 1000, 0, 5000),
+        maxPayloadBytes: integer('max_payload_bytes', 64 * 1024 * 1024, 1024 * 1024, 256 * 1024 * 1024),
+        expectedFingerprint: typeof p.expected_fingerprint === 'string' ? p.expected_fingerprint : undefined,
+        applyEnabled: p.apply_enabled === true,
+        acceptAmbiguousCommit: p.accept_ambiguous_commit === true,
+      });
+    } catch (error) {
+      throw new OperationError('storage_error', error instanceof Error ? error.message : String(error));
+    }
   },
 };
 
@@ -5667,7 +5723,7 @@ export const operations: Operation[] = [
   // Timeline
   add_timeline_entry, get_timeline,
   // Admin
-  get_stats, get_health, run_doctor, get_versions, revert_version,
+  get_stats, get_health, run_doctor, get_versions, revert_version, page_version_retention_exact,
   // v0.31.1 (Issue #734): thin-client banner identity packet (read-scope, banner-only)
   get_brain_identity,
   // PR1: skill catalog over MCP — discover + fetch host-repo skills (read-scope)

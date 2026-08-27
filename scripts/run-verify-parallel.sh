@@ -108,6 +108,15 @@ fi
 START_TS=$(date +%s)
 echo "[verify-parallel] running ${#CHECKS[@]} checks in parallel (timeout=${TIMEOUT}s, logs=$LOG_DIR)" >&2
 
+collect_process_tree() {
+  local root="$1"
+  local child
+  for child in $(pgrep -P "$root" 2>/dev/null || true); do
+    collect_process_tree "$child"
+  done
+  printf '%s\n' "$root"
+}
+
 # ──────────────────────────────────────────────────────────────────────────
 # Spawn one background process per check. Each child captures its own exit
 # code into a sentinel file under $LOG_DIR/<safe-name>.exit; the parent
@@ -123,20 +132,31 @@ for c in "${CHECKS[@]}"; do
   SAFE_NAMES+=("$safe")
   LOG_FILE="$LOG_DIR/$safe.log"
   EXIT_FILE="$LOG_DIR/$safe.exit"
+  TIMEOUT_FILE="$LOG_DIR/$safe.timeout"
   (
     if [ -n "$TIMEOUT_BIN" ]; then
       "$TIMEOUT_BIN" "${TIMEOUT}s" bun run "$c" > "$LOG_FILE" 2>&1
+      rc=$?
     else
       bun run "$c" > "$LOG_FILE" 2>&1 &
       pid=$!
-      ( sleep "$TIMEOUT" && kill -TERM "$pid" 2>/dev/null && \
-        sleep 5 && kill -KILL "$pid" 2>/dev/null ) &
+      (
+        sleep "$TIMEOUT"
+        if kill -0 "$pid" 2>/dev/null; then
+          : > "$TIMEOUT_FILE"
+          targets="$(collect_process_tree "$pid")"
+          for target in $targets; do kill -TERM "$target" 2>/dev/null || true; done
+          sleep 5
+          for target in $targets; do kill -KILL "$target" 2>/dev/null || true; done
+        fi
+      ) &
       cap_pid=$!
       wait "$pid" 2>/dev/null
+      rc=$?
       kill "$cap_pid" 2>/dev/null
-      wait "$cap_pid" 2>/dev/null
+      wait "$cap_pid" 2>/dev/null || true
+      if [ -f "$TIMEOUT_FILE" ]; then rc=124; fi
     fi
-    rc=$?
     echo "$rc" > "$EXIT_FILE"
   ) &
   PIDS+=($!)
