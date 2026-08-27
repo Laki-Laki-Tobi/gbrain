@@ -146,6 +146,8 @@ export interface LinkBatchInput {
   origin_slug?: string;
   /** Frontmatter field name (e.g. 'key_people', 'investors'). */
   origin_field?: string;
+  /** Optional source-resolution provenance stored on the edge. */
+  resolution_type?: 'qualified' | 'unqualified';
   /**
    * v0.18.0: source id for each endpoint. When omitted, the engine JOINs
    * against `source_id='default'`. Pass explicit values when the edge
@@ -170,6 +172,23 @@ export interface LinkBatchInput {
    * legacy / unknown / pre-v98 semantics.
    */
   link_kind?: string;
+}
+
+/** Full persisted identity of one link, including explicit nullable provenance. */
+export interface ExactLinkIdentity {
+  from_slug: string;
+  to_slug: string;
+  link_type: string;
+  context: string;
+  link_source: string | null;
+  origin_slug: string | null;
+  origin_field: string | null;
+  resolution_type: 'qualified' | 'unqualified' | null;
+}
+
+export interface ExactPageMetadataPatch {
+  patch: Record<string, unknown>;
+  unset: string[];
 }
 
 /** Input row for addTimelineEntriesBatch. Optional fields default to '' (matches NOT NULL DDL). */
@@ -688,6 +707,13 @@ export interface BrainEngine {
    * duplicate at (default, slug). Multi-source brains MUST pass sourceId.
    */
   putPage(slug: string, page: PageInput, opts?: { sourceId?: string }): Promise<Page>;
+  /** Atomically patch frontmatter only when the active page hash still matches. */
+  patchPageMetadataExact(
+    slug: string,
+    expectedContentHash: string,
+    mutation: ExactPageMetadataPatch,
+    opts?: { sourceId?: string },
+  ): Promise<{ before: Page; content_hash: string }>;
   /**
    * v0.41.13 (#1309) — identity-based dedup pre-check for the import pipeline.
    *
@@ -828,8 +854,10 @@ export interface BrainEngine {
    * behavior is preserved for back-compat with internal callers (the
    * `gbrain query --resolve` CLI path, etc.). Field names match the
    * `sourceScopeOpts(ctx)` helper output so callers can spread directly.
+   * Soft-deleted rows are excluded unless `includeDeleted` is explicitly true;
+   * that opt-in exists only for recovery and cleanup workflows.
    */
-  resolveSlugs(partial: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<string[]>;
+  resolveSlugs(partial: string, opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean }): Promise<string[]>;
   /**
    * Returns the slug of every page in the brain. Used by batch commands as a
    * mutation-immune iteration source (alternative to listPages OFFSET pagination,
@@ -1109,7 +1137,12 @@ export interface BrainEngine {
     linkSource?: string,
     originSlug?: string,
     originField?: string,
-    opts?: { fromSourceId?: string; toSourceId?: string; originSourceId?: string },
+    opts?: {
+      fromSourceId?: string;
+      toSourceId?: string;
+      originSourceId?: string;
+      resolutionType?: 'qualified' | 'unqualified';
+    },
   ): Promise<void>;
   /**
    * Bulk insert links via a single multi-row INSERT...SELECT FROM (VALUES) JOIN pages
@@ -1127,6 +1160,8 @@ export interface BrainEngine {
    * Callers MUST NOT wrap externally; see {@link BatchOpts} retry contract.
    */
   addLinksBatch(links: LinkBatchInput[], opts?: BatchOpts): Promise<number>;
+  /** Local-admin rollback primitive. Restores one exact edge without rewriting provenance. */
+  restoreLinkExact(edge: ExactLinkIdentity, opts?: { sourceId?: string }): Promise<void>;
   /**
    * Remove links from `from` to `to`. If linkType is provided, only that specific
    * (from, to, type) row is removed. If omitted, ALL link types between the pair
@@ -1140,7 +1175,19 @@ export interface BrainEngine {
     to: string,
     linkType?: string,
     linkSource?: string,
-    opts?: { fromSourceId?: string; toSourceId?: string },
+    opts?: {
+      fromSourceId?: string;
+      toSourceId?: string;
+      originSourceId?: string;
+      originSlug?: string;
+      originField?: string;
+      context?: string;
+      resolutionType?: 'qualified' | 'unqualified';
+      linkSourceIsNull?: boolean;
+      originSlugIsNull?: boolean;
+      originFieldIsNull?: boolean;
+      resolutionTypeIsNull?: boolean;
+    },
   ): Promise<void>;
   /**
    * v0.31.8 (D12 + D16): `opts.sourceId` source-scopes the from-page lookup.
@@ -1158,13 +1205,13 @@ export interface BrainEngine {
    * grant); the scalar branch is internal/CLI and keeps cross-source visibility
    * (reconcileLinks + back-link validators depend on it).
    */
-  getLinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]>;
+  getLinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean }): Promise<Link[]>;
   /**
    * v0.31.8 (D12 + D16): same `opts.sourceId` semantics as `getLinks`,
    * applied to the to-page side of the join. #2200: `opts.sourceIds` federated
    * grant constrains both endpoints (see `getLinks`).
    */
-  getBacklinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]>;
+  getBacklinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean }): Promise<Link[]>;
   /**
    * v114 (#1941): distinct link_source provenances with edge counts, for
    * `gbrain link-sources`. Source-scoped via `{sourceId?, sourceIds?}` (both

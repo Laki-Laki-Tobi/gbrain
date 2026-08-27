@@ -222,6 +222,168 @@ describe('remove_link op — type/source filters', () => {
     expect(sources).toContain('citation-graph');
     expect(sources).not.toContain('manual');
   });
+
+  test('exact provenance filters delete one edge without touching its semantic sibling', async () => {
+    await engine.putPage('rm-exact-from', { type: 'note', title: 'From', compiled_truth: 'from', timeline: '', frontmatter: {} });
+    await engine.putPage('rm-exact-to', { type: 'note', title: 'To', compiled_truth: 'to', timeline: '', frontmatter: {} });
+    await engine.putPage('rm-exact-origin', { type: 'note', title: 'Origin', compiled_truth: 'origin', timeline: '', frontmatter: {} });
+    await engine.addLink(
+      'rm-exact-from', 'rm-exact-to', 'generated telemetry', 'recall_surface', 'manual',
+      'rm-exact-from', 'governance', { resolutionType: 'qualified' },
+    );
+    await engine.addLink(
+      'rm-exact-from', 'rm-exact-to', 'durable semantic relation', 'recall_surface', 'manual',
+      'rm-exact-origin', 'related', { resolutionType: 'qualified' },
+    );
+
+    const before = await engine.getLinks('rm-exact-from');
+    expect(before.filter(link => link.to_slug === 'rm-exact-to')).toHaveLength(2);
+    expect(before.every(link => link.resolution_type === 'qualified')).toBe(true);
+
+    await operationsByName.remove_link.handler(makeCtx(), {
+      from: 'rm-exact-from',
+      to: 'rm-exact-to',
+      link_type: 'recall_surface',
+      link_source: 'manual',
+      origin_slug: 'rm-exact-from',
+      origin_field: 'governance',
+      context: 'generated telemetry',
+      resolution_type: 'qualified',
+    });
+
+    const after = (await engine.getLinks('rm-exact-from')).filter(link => link.to_slug === 'rm-exact-to');
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({
+      context: 'durable semantic relation',
+      origin_slug: 'rm-exact-origin',
+      origin_field: 'related',
+      resolution_type: 'qualified',
+    });
+  });
+
+  test('exact NULL provenance filters remove one legacy edge only', async () => {
+    await engine.putPage('rm-null-from', { type: 'note', title: 'From', compiled_truth: 'from', timeline: '', frontmatter: {} });
+    await engine.putPage('rm-null-to', { type: 'note', title: 'To', compiled_truth: 'to', timeline: '', frontmatter: {} });
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field, resolution_type)
+       SELECT f.id, t.id, 'proposal_autopilot_item', '', NULL, NULL, NULL, NULL
+       FROM pages f, pages t
+       WHERE f.slug = 'rm-null-from' AND t.slug = 'rm-null-to'`,
+    );
+    await engine.addLink(
+      'rm-null-from', 'rm-null-to', 'durable semantic relation', 'proposal_autopilot_item', 'manual',
+      'rm-null-from', 'related', { resolutionType: 'qualified' },
+    );
+
+    await operationsByName.remove_link.handler(makeCtx(), {
+      from: 'rm-null-from',
+      to: 'rm-null-to',
+      link_type: 'proposal_autopilot_item',
+      context: '',
+      link_source_is_null: true,
+      origin_slug_is_null: true,
+      origin_field_is_null: true,
+      resolution_type_is_null: true,
+    });
+
+    const remaining = (await engine.getLinks('rm-null-from')).filter(link => link.to_slug === 'rm-null-to');
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]).toMatchObject({
+      link_source: 'manual',
+      context: 'durable semantic relation',
+      origin_field: 'related',
+      resolution_type: 'qualified',
+    });
+  });
+
+  test('restore_link_exact is local-only admin and restores exact NULL provenance', async () => {
+    const op = operationsByName.restore_link_exact;
+    expect(op.localOnly).toBe(true);
+    expect(op.scope).toBe('admin');
+    expect(op.mutating).toBe(true);
+    await engine.putPage('restore-null-from', { type: 'note', title: 'From', compiled_truth: 'from', timeline: '', frontmatter: {} });
+    await engine.putPage('restore-null-to', { type: 'note', title: 'To', compiled_truth: 'to', timeline: '', frontmatter: {} });
+    await engine.softDeletePage('restore-null-to');
+
+    await op.handler(makeCtx(), {
+      from: 'restore-null-from',
+      to: 'restore-null-to',
+      link_type: 'legacy_ref',
+      context: '',
+      link_source_is_null: true,
+      origin_slug_is_null: true,
+      origin_field_is_null: true,
+      resolution_type_is_null: true,
+    });
+
+    expect(await engine.getLinks('restore-null-from')).toEqual([]);
+    const [restored] = await engine.getLinks('restore-null-from', { includeDeleted: true });
+    expect(restored).toEqual({
+      from_slug: 'restore-null-from',
+      to_slug: 'restore-null-to',
+      link_type: 'legacy_ref',
+      context: '',
+      link_source: null,
+      origin_slug: null,
+      origin_field: null,
+      resolution_type: null,
+    });
+  });
+
+  test('read -> exact unlink -> exact restore preserves managed provenance identity', async () => {
+    await engine.putPage('restore-managed-from', { type: 'note', title: 'From', compiled_truth: 'from', timeline: '', frontmatter: {} });
+    await engine.putPage('restore-managed-to', { type: 'note', title: 'To', compiled_truth: 'to', timeline: '', frontmatter: {} });
+    await engine.putPage('restore-managed-origin', { type: 'note', title: 'Origin', compiled_truth: 'origin', timeline: '', frontmatter: {} });
+    await engine.addLink(
+      'restore-managed-from', 'restore-managed-to', 'managed context', 'related',
+      'frontmatter', 'restore-managed-origin', 'related', { resolutionType: 'unqualified' },
+    );
+    const [snapshot] = await engine.getLinks('restore-managed-from', { includeDeleted: true });
+
+    await operationsByName.remove_link.handler(makeCtx(), {
+      from: snapshot.from_slug,
+      to: snapshot.to_slug,
+      link_type: snapshot.link_type,
+      context: snapshot.context,
+      link_source: snapshot.link_source,
+      origin_slug: snapshot.origin_slug,
+      origin_field: snapshot.origin_field,
+      resolution_type: snapshot.resolution_type,
+    });
+    expect(await engine.getLinks('restore-managed-from', { includeDeleted: true })).toEqual([]);
+
+    await operationsByName.restore_link_exact.handler(makeCtx(), {
+      from: snapshot.from_slug,
+      to: snapshot.to_slug,
+      link_type: snapshot.link_type,
+      context: snapshot.context,
+      link_source: snapshot.link_source,
+      origin_slug: snapshot.origin_slug,
+      origin_field: snapshot.origin_field,
+      resolution_type: snapshot.resolution_type,
+    });
+    expect(await engine.getLinks('restore-managed-from', { includeDeleted: true })).toEqual([snapshot]);
+  });
+
+  test('restore_link_exact rejects incomplete identity and missing origin before insert', async () => {
+    await engine.putPage('restore-fail-from', { type: 'note', title: 'From', compiled_truth: 'from', timeline: '', frontmatter: {} });
+    await engine.putPage('restore-fail-to', { type: 'note', title: 'To', compiled_truth: 'to', timeline: '', frontmatter: {} });
+    const base = {
+      from: 'restore-fail-from',
+      to: 'restore-fail-to',
+      link_type: 'related',
+      context: '',
+      link_source: 'frontmatter',
+      origin_field: 'related',
+      resolution_type: 'qualified',
+    };
+    await expect(operationsByName.restore_link_exact.handler(makeCtx(), base)).rejects.toThrow('origin_slug');
+    await expect(operationsByName.restore_link_exact.handler(makeCtx(), {
+      ...base,
+      origin_slug: 'restore-fail-missing-origin',
+    })).rejects.toThrow('not found');
+    expect(await engine.getLinks('restore-fail-from', { includeDeleted: true })).toEqual([]);
+  });
 });
 
 describe('list_link_sources op (B4 + OV8 + OV9)', () => {

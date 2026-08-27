@@ -162,6 +162,14 @@ describe('PGLiteEngine: Pages', () => {
     expect(slugs).toContain('people/sarah-chen');
   });
 
+  test('resolveSlugs only includes soft-deleted rows with explicit recovery opt-in', async () => {
+    await engine.putPage('people/sarah-recovery', { ...testPage, title: 'Sarah Recovery' });
+    await engine.softDeletePage('people/sarah-recovery');
+
+    expect(await engine.resolveSlugs('sarah recovery')).toEqual([]);
+    expect(await engine.resolveSlugs('sarah recovery', { includeDeleted: true })).toContain('people/sarah-recovery');
+  });
+
   test('updateSlug renames page', async () => {
     await engine.putPage('test/old-name', testPage);
     await engine.updateSlug('test/old-name', 'test/new-name');
@@ -563,6 +571,48 @@ describe('PGLiteEngine: Links', () => {
     expect(backlinks[0].from_slug).toBe('people/alice');
   });
 
+  test('soft-deleted endpoints disappear from links and backlinks', async () => {
+    await engine.addLink('people/alice', 'companies/acme');
+    await engine.softDeletePage('people/alice');
+
+    expect(await engine.getLinks('people/alice')).toEqual([]);
+    expect(await engine.getBacklinks('companies/acme')).toEqual([]);
+    expect(await engine.getBacklinks('companies/acme', { sourceId: 'default' })).toEqual([]);
+    expect(await engine.getBacklinks('companies/acme', { sourceIds: ['default'] })).toEqual([]);
+    expect(await engine.getLinks('people/alice', { includeDeleted: true })).toHaveLength(1);
+    expect(await engine.getBacklinks('companies/acme', { includeDeleted: true })).toHaveLength(1);
+    expect(await engine.getBacklinks('companies/acme', { sourceId: 'default', includeDeleted: true })).toHaveLength(1);
+    expect(await engine.getBacklinks('companies/acme', { sourceIds: ['default'], includeDeleted: true })).toHaveLength(1);
+  });
+
+  test('edges with soft-deleted origins are hidden unless recovery is explicit', async () => {
+    await engine.addLink(
+      'people/alice',
+      'companies/acme',
+      '',
+      'related',
+      'frontmatter',
+      'companies/beta',
+      'related',
+    );
+    await engine.softDeletePage('companies/beta');
+
+    expect(await engine.getLinks('people/alice')).toEqual([]);
+    expect(await engine.getLinks('people/alice', { sourceId: 'default' })).toEqual([]);
+    expect(await engine.getLinks('people/alice', { sourceIds: ['default'] })).toEqual([]);
+    expect(await engine.getBacklinks('companies/acme')).toEqual([]);
+    expect(await engine.getBacklinks('companies/acme', { sourceId: 'default' })).toEqual([]);
+    expect(await engine.getBacklinks('companies/acme', { sourceIds: ['default'] })).toEqual([]);
+
+    const [recoveryLink] = await engine.getLinks('people/alice', { includeDeleted: true });
+    expect(recoveryLink.origin_slug).toBe('companies/beta');
+    expect(await engine.getLinks('people/alice', { sourceId: 'default', includeDeleted: true })).toHaveLength(1);
+    expect(await engine.getLinks('people/alice', { sourceIds: ['default'], includeDeleted: true })).toHaveLength(1);
+    expect(await engine.getBacklinks('companies/acme', { includeDeleted: true })).toHaveLength(1);
+    expect(await engine.getBacklinks('companies/acme', { sourceId: 'default', includeDeleted: true })).toHaveLength(1);
+    expect(await engine.getBacklinks('companies/acme', { sourceIds: ['default'], includeDeleted: true })).toHaveLength(1);
+  });
+
   test('removeLink', async () => {
     await engine.addLink('people/alice', 'companies/acme');
     await engine.removeLink('people/alice', 'companies/acme');
@@ -579,6 +629,17 @@ describe('PGLiteEngine: Links', () => {
     const slugs = graph.map(n => n.slug);
     expect(slugs).toContain('people/alice');
     expect(slugs).toContain('companies/acme');
+  });
+
+  test('traverseGraph hides soft-deleted seeds, neighbors, and aggregate links', async () => {
+    await engine.addLink('people/alice', 'companies/acme');
+    await engine.addLink('companies/acme', 'companies/beta');
+    await engine.softDeletePage('companies/acme');
+
+    const graph = await engine.traverseGraph('people/alice', 2);
+    expect(graph.map(node => node.slug)).toEqual(['people/alice']);
+    expect(graph[0]?.links).toEqual([]);
+    expect(await engine.traverseGraph('companies/acme', 2)).toEqual([]);
   });
 });
 
@@ -1038,6 +1099,25 @@ describe('PGLiteEngine: getAllSlugs', () => {
     const slugs = await engine.getAllSlugs();
     expect(slugs.size).toBe(0);
   });
+
+  test('excludes soft-deleted slugs from unscoped and source-scoped sets', async () => {
+    await engine.softDeletePage('people/alice');
+
+    const allSlugs = await engine.getAllSlugs();
+    const defaultSlugs = await engine.getAllSlugs({ sourceId: 'default' });
+
+    expect(allSlugs.has('people/alice')).toBe(false);
+    expect(defaultSlugs.has('people/alice')).toBe(false);
+    expect(defaultSlugs.has('people/bob')).toBe(true);
+  });
+
+  test('findByTitleFuzzy excludes soft-deleted pages', async () => {
+    await engine.softDeletePage('companies/acme');
+
+    const match = await engine.findByTitleFuzzy('Acme', 'companies', 0.55);
+
+    expect(match).toBeNull();
+  });
 });
 
 describe('PGLiteEngine: listPages updated_after filter', () => {
@@ -1216,6 +1296,20 @@ describe('PGLiteEngine: traversePaths (v0.10.1)', () => {
     const acmePaths = paths.filter(p => p.to_slug === 'companies/acme');
     expect(acmePaths.length).toBe(2);
     expect(acmePaths.every(p => p.depth === 2)).toBe(true);
+  });
+
+  test('soft-deleted destinations are excluded from traversal', async () => {
+    await engine.softDeletePage('people/alice');
+
+    const paths = await engine.traversePaths('meetings/standup', { depth: 2 });
+
+    expect(paths.some(p => p.from_slug === 'people/alice' || p.to_slug === 'people/alice')).toBe(false);
+  });
+
+  test('soft-deleted seed returns empty traversal', async () => {
+    await engine.softDeletePage('meetings/standup');
+
+    expect(await engine.traversePaths('meetings/standup', { depth: 2 })).toEqual([]);
   });
 
   test('non-existent slug returns empty', async () => {

@@ -2,6 +2,35 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.1] - 2026-08-27
+
+### Fixed
+- Soft-deleted pages no longer participate in default slug, fuzzy-title, link,
+  backlink, or graph traversal reads. Explicit `include_deleted` remains
+  available for recovery and controlled cleanup.
+- Slug resolution now honors source scope and excludes soft-deleted candidates
+  unless recovery is explicitly requested.
+- Link reads expose `resolution_type`, and `remove_link` can match an exact edge
+  by type, provenance, origin, context, and resolution metadata. Explicit NULL
+  selectors support reviewed cleanup of legacy edges without widening deletion
+  to semantic siblings on the same page pair.
+- Manually created governance links can persist origin and resolution metadata,
+  and batch link insertion preserves `resolution_type`.
+- Local-admin `restore_link_exact` restores one reviewed link with its original
+  managed or NULL provenance, enabling identity-preserving cleanup rollback.
+- Local-admin `patch_page_metadata_exact` applies a hash-gated governance-only
+  frontmatter patch atomically without creating page versions, chunks,
+  embeddings, tags, links, or timeline side effects.
+- Local-admin `put_page_file_exact` validates a private local UTF-8 file and
+  applies it through canonical page ingestion only when the active page hash
+  still matches, preserving normal version and reconciliation behavior without
+  adding capture provenance.
+- Default link reads now hide edges authored by a soft-deleted or otherwise
+  invisible origin; explicit `include_deleted` maintenance reads retain the
+  full identity needed for exact cleanup and recovery.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.0] - 2026-07-13
 
 **Five community-reported fixes, each reproduced and verified before/after on both engines (PGLite + real Postgres): an upgrade wedge that locked pre-v121 brains out of migrations, two data-integrity holes in engine migration, silent deletion of facts containing pipe characters, confidently-wrong entity attribution on ambiguous names, and tightened source-scope enforcement in `think`.**

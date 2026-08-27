@@ -94,7 +94,7 @@ beforeEach(async () => {
   // Far-endpoint-leak backlink: referrer in 'default' → must NOT show for [alpha,beta].
   await engine.addLink('default/only-doc', 'secret/beta-doc', 'LEAK back', 'cites', 'markdown', undefined, undefined, { fromSourceId: 'default', toSourceId: 'beta' });
   // Origin-leak guard (F1): both endpoints in-grant (beta→beta) but the AUTHORING
-  // (origin) page is out-of-grant ('default'). origin_slug must NOT leak that slug.
+  // (origin) page is out-of-grant ('default'). The lossy edge must be hidden.
   await engine.addLink('secret/beta-doc', 'secret/beta-target', 'origin-leak ctx', 'mentions', 'frontmatter', 'default/only-doc', 'related', { fromSourceId: 'beta', toSourceId: 'beta', originSourceId: 'default' });
   // Timeline entry on the beta page.
   await engine.addTimelineEntry('secret/beta-doc', {
@@ -201,12 +201,10 @@ describe('#2200 get_links honors the grant and scopes BOTH endpoints (D4A)', () 
     expect(links).toEqual([]);
   });
 
-  test('F1: in-grant link authored by an out-of-grant origin does NOT leak origin_slug', async () => {
+  test('F1: in-grant link authored by an out-of-grant origin is hidden', async () => {
     const links = (await get_links.handler(remoteCtx(['alpha', 'beta']), { slug: 'secret/beta-doc' })) as any[];
     const originLeakLink = links.find(l => l.link_type === 'mentions' && l.to_slug === 'secret/beta-target');
-    expect(originLeakLink).toBeDefined();
-    // origin page 'default/only-doc' is out of the [alpha,beta] grant → origin_slug nulled.
-    expect(originLeakLink.origin_slug ?? null).toBeNull();
+    expect(originLeakLink).toBeUndefined();
     expect(links.map(l => l.origin_slug)).not.toContain('default/only-doc');
   });
 

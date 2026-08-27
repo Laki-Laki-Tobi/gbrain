@@ -23,6 +23,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { operationsByName, type OperationContext } from '../src/core/operations.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 
 let engine: PGLiteEngine;
@@ -112,5 +113,48 @@ describe('#1436 — resolveSlugs honors source scope', () => {
     expect(alpha).toEqual([]);
     const beta = await engine.resolveSlugs('people/alice', { sourceId: 'beta' });
     expect(beta).toEqual(['people/alice']);
+  });
+
+  test('resolve_slugs operation preserves source scope and requires explicit deleted recovery', async () => {
+    await engine.softDeletePage('people/alice', { sourceId: 'alpha' });
+    const op = operationsByName.resolve_slugs!;
+    const ctx = {
+      engine,
+      config: {},
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      dryRun: false,
+      remote: false,
+      sourceId: 'alpha',
+    } as unknown as OperationContext;
+
+    expect(await op.handler(ctx, { partial: 'people/alice' })).toEqual([]);
+    expect(await op.handler(ctx, { partial: 'people/alice', include_deleted: true })).toEqual(['people/alice']);
+  });
+
+  test('get_page fuzzy recovery can resolve a soft-deleted page in the caller source', async () => {
+    await engine.putPage('people/zyxw-recovery', {
+      type: 'person',
+      title: 'Zyxw Recovery',
+      compiled_truth: 'Recovery-only page.',
+      frontmatter: { type: 'person' },
+    }, { sourceId: 'alpha' });
+    await engine.softDeletePage('people/zyxw-recovery', { sourceId: 'alpha' });
+    const op = operationsByName.get_page!;
+    const ctx = {
+      engine,
+      config: {},
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      dryRun: false,
+      remote: false,
+      sourceId: 'alpha',
+    } as unknown as OperationContext;
+
+    const result = await op.handler(ctx, {
+      slug: 'zyxw recovery',
+      fuzzy: true,
+      include_deleted: true,
+    }) as { slug: string; deleted_at: string | null };
+    expect(result.slug).toBe('people/zyxw-recovery');
+    expect(result.deleted_at).not.toBeNull();
   });
 });

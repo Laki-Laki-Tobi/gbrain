@@ -135,6 +135,26 @@ describe('addLinksBatch — JSONB poison (#1861)', () => {
     );
     expect(rows[0].link_kind).toBeNull();
   });
+
+  it('round-trips resolution_type through the jsonb recordset', async () => {
+    await seed('a'); await seed('b');
+    await engine.addLinksBatch([
+      {
+        from_slug: 'a',
+        to_slug: 'b',
+        link_type: 'recall_surface',
+        link_source: 'manual',
+        origin_slug: 'a',
+        origin_field: 'governance',
+        resolution_type: 'qualified',
+      },
+    ]);
+    const rows = await engine.executeRaw<{ resolution_type: string | null }>(
+      `SELECT l.resolution_type FROM links l JOIN pages p ON p.id = l.from_page_id
+       WHERE p.slug = 'a'`,
+    );
+    expect(rows[0].resolution_type).toBe('qualified');
+  });
 });
 
 describe('addTimelineEntriesBatch — JSONB poison (#1861)', () => {

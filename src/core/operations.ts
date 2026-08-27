@@ -3,9 +3,11 @@
  * Each operation defines its schema, handler, and optional CLI hints.
  */
 
-import { lstatSync, realpathSync } from 'fs';
-import { resolve, relative, sep } from 'path';
-import type { BrainEngine } from './engine.ts';
+import { constants, lstatSync, realpathSync } from 'fs';
+import { lstat, open } from 'node:fs/promises';
+import { isAbsolute, resolve, relative, sep } from 'path';
+import { isDeepStrictEqual } from 'node:util';
+import type { BrainEngine, ExactLinkIdentity } from './engine.ts';
 import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
@@ -652,7 +654,7 @@ const get_page: Operation = {
     // an UNSCOPED exact lookup — a cross-source read of any page by slug. getPage
     // now honors sourceIds[] (both engines), so the same scope closes both paths.
     const sourceOpts = sourceScopeOpts(ctx);
-    const fuzzyScope = sourceOpts;
+    const fuzzyScope = { ...sourceOpts, includeDeleted };
 
     let page = await ctx.engine.getPage(slug, { includeDeleted, ...sourceOpts });
     let resolved_slug: string | undefined;
@@ -1109,6 +1111,91 @@ const put_page: Operation = {
     };
   },
   cliHints: { name: 'put', positional: ['slug'], stdin: 'content' },
+};
+
+const PUT_PAGE_FILE_EXACT_MAX_BYTES = 16 * 1024 * 1024;
+
+const put_page_file_exact: Operation = {
+  name: 'put_page_file_exact',
+  description: 'Local-admin hash-gated canonical page ingestion from a private local UTF-8 file.',
+  params: {
+    slug: { type: 'string', required: true },
+    expected_content_hash: { type: 'string', required: true },
+    file_path: { type: 'string', required: true },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError(
+        'permission_denied',
+        'put_page_file_exact is local-only and must be called through the local CLI.',
+      );
+    }
+    const slug = requireExactString(p, 'slug');
+    const expectedContentHash = requireExactString(p, 'expected_content_hash');
+    const filePath = requireExactString(p, 'file_path');
+    if (!isAbsolute(filePath)) {
+      throw new OperationError('invalid_params', 'file_path must be absolute');
+    }
+
+    let content: string;
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      const pathStat = await lstat(filePath);
+      if (!pathStat.isFile()) {
+        throw new OperationError('invalid_params', 'file_path must reference a regular file');
+      }
+      handle = await open(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      const fileStat = await handle.stat();
+      if (!fileStat.isFile()) {
+        throw new OperationError('invalid_params', 'file_path must reference a regular file');
+      }
+      if ((fileStat.mode & 0o7777) !== 0o600) {
+        throw new OperationError('invalid_params', 'file mode must be exactly 0600');
+      }
+      if (fileStat.size > PUT_PAGE_FILE_EXACT_MAX_BYTES) {
+        throw new OperationError('invalid_params', 'file exceeds the 16 MiB size limit');
+      }
+      const bytes = await handle.readFile();
+      if (bytes.byteLength > PUT_PAGE_FILE_EXACT_MAX_BYTES) {
+        throw new OperationError('invalid_params', 'file exceeds the 16 MiB size limit');
+      }
+      if (bytes.includes(0)) {
+        throw new OperationError('invalid_params', 'file must be UTF-8 text without NUL bytes');
+      }
+      try {
+        content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      } catch {
+        throw new OperationError('invalid_params', 'file must contain valid UTF-8 text');
+      }
+    } catch (error) {
+      if (error instanceof OperationError) throw error;
+      throw new OperationError('invalid_params', 'file_path could not be opened or validated');
+    } finally {
+      await handle?.close();
+    }
+
+    const sourceId = ctx.sourceId || 'default';
+    const current = await ctx.engine.getPage(slug, { sourceId });
+    if (!current) {
+      throw new OperationError('page_not_found', `Active page not found: ${slug}`);
+    }
+    if (current.content_hash !== expectedContentHash) {
+      throw new OperationError('storage_error', `put_page_file_exact drift: content hash changed for "${slug}"`);
+    }
+    if (ctx.dryRun) {
+      return { dry_run: true, action: 'put_page_file_exact', slug };
+    }
+
+    await put_page.handler(ctx, { slug, content });
+    const readback = await ctx.engine.getPage(slug, { sourceId });
+    if (!readback) {
+      throw new OperationError('storage_error', `put_page_file_exact readback missing for ${slug}`);
+    }
+    return { status: 'written', slug, content_hash: readback.content_hash };
+  },
 };
 
 // v0.31.2: isFactsBackstopEligible moved to src/core/facts/eligibility.ts
@@ -1969,6 +2056,58 @@ const get_tags: Operation = {
  */
 export const MANAGED_LINK_SOURCES = ['markdown', 'frontmatter', 'mentions', 'wikilink-resolved'];
 
+function requireExactString(p: Record<string, unknown>, key: string, allowEmpty = false): string {
+  if (!Object.hasOwn(p, key) || typeof p[key] !== 'string' || (!allowEmpty && p[key] === '')) {
+    throw new OperationError('invalid_params', `${key} must be provided explicitly as a string`);
+  }
+  return p[key] as string;
+}
+
+function requireExactNullableString(
+  p: Record<string, unknown>,
+  key: string,
+  nullKey: string,
+): string | null {
+  const hasValue = Object.hasOwn(p, key);
+  const isNull = p[nullKey] === true;
+  if (hasValue === isNull) {
+    throw new OperationError('invalid_params', `provide exactly one of ${key} or ${nullKey}=true`);
+  }
+  if (isNull) return null;
+  if (typeof p[key] !== 'string' || p[key] === '') {
+    throw new OperationError('invalid_params', `${key} must be a non-empty string`);
+  }
+  return p[key] as string;
+}
+
+function parseExactLinkIdentity(p: Record<string, unknown>): ExactLinkIdentity {
+  const resolutionType = requireExactNullableString(p, 'resolution_type', 'resolution_type_is_null');
+  if (resolutionType !== null && resolutionType !== 'qualified' && resolutionType !== 'unqualified') {
+    throw new OperationError('invalid_params', "resolution_type must be 'qualified' or 'unqualified'");
+  }
+  return {
+    from_slug: requireExactString(p, 'from'),
+    to_slug: requireExactString(p, 'to'),
+    link_type: requireExactString(p, 'link_type', true),
+    context: requireExactString(p, 'context', true),
+    link_source: requireExactNullableString(p, 'link_source', 'link_source_is_null'),
+    origin_slug: requireExactNullableString(p, 'origin_slug', 'origin_slug_is_null'),
+    origin_field: requireExactNullableString(p, 'origin_field', 'origin_field_is_null'),
+    resolution_type: resolutionType,
+  };
+}
+
+function linkIdentityMatches(link: import('./types.ts').Link, edge: ExactLinkIdentity): boolean {
+  return link.from_slug === edge.from_slug
+    && link.to_slug === edge.to_slug
+    && link.link_type === edge.link_type
+    && link.context === edge.context
+    && (link.link_source ?? null) === edge.link_source
+    && (link.origin_slug ?? null) === edge.origin_slug
+    && (link.origin_field ?? null) === edge.origin_field
+    && (link.resolution_type ?? null) === edge.resolution_type;
+}
+
 const add_link: Operation = {
   name: 'add_link',
   description: 'Create link between pages',
@@ -1978,6 +2117,9 @@ const add_link: Operation = {
     link_type: { type: 'string', description: 'Link type (e.g., invested_in, works_at)' },
     context: { type: 'string', description: 'Context for the link' },
     link_source: { type: 'string', description: "Provenance tag (kebab-case, e.g. 'citation-graph'). Defaults to 'manual'. Reconciliation-managed built-ins (markdown/frontmatter/mentions/wikilink-resolved) are rejected." },
+    origin_slug: { type: 'string', description: 'Optional exact provenance origin page slug' },
+    origin_field: { type: 'string', description: 'Optional exact provenance field' },
+    resolution_type: { type: 'string', description: "Optional source-resolution provenance: 'qualified' or 'unqualified'" },
   },
   mutating: true,
   scope: 'write',
@@ -1993,6 +2135,15 @@ const add_link: Operation = {
         `use 'manual' (the default) or a custom kebab tag like 'citation-graph'`,
       );
     }
+    const originSlug = (p.origin_slug as string) || undefined;
+    const originField = (p.origin_field as string) || undefined;
+    if (Boolean(originSlug) !== Boolean(originField)) {
+      throw new Error('origin_slug and origin_field must be provided together');
+    }
+    const resolutionType = (p.resolution_type as string) || undefined;
+    if (resolutionType && !['qualified', 'unqualified'].includes(resolutionType)) {
+      throw new Error("resolution_type must be 'qualified' or 'unqualified'");
+    }
     // v0.31.8 (D7): single ctx.sourceId scopes both endpoints + origin. Cross-
     // source link creation is out of scope for this wave; use the engine API
     // directly for that edge case.
@@ -2002,8 +2153,8 @@ const add_link: Operation = {
     await ctx.engine.addLink( // gbrain-allow-direct-insert: add_link MCP op is the explicit canonical surface for manual link creation; auto-link reconciliation runs separately via auto_link post-hook
       p.from as string, p.to as string,
       (p.context as string) || '', (p.link_type as string) || '',
-      linkSource, undefined, undefined,
-      linkOpts,
+      linkSource, originSlug, originField,
+      { ...linkOpts, resolutionType: resolutionType as 'qualified' | 'unqualified' | undefined },
     );
     return { status: 'ok' };
   },
@@ -2018,11 +2169,31 @@ const remove_link: Operation = {
     to: { type: 'string', required: true },
     link_type: { type: 'string', description: 'Only remove edges of this link type (omit = all types)' },
     link_source: { type: 'string', description: 'Only remove edges of this provenance (e.g. citation-graph); omit = any provenance' },
+    origin_slug: { type: 'string', description: 'Only remove edges authored by this exact origin page' },
+    origin_field: { type: 'string', description: 'Only remove edges with this exact origin field' },
+    context: { type: 'string', description: 'Only remove edges with this exact context' },
+    resolution_type: { type: 'string', description: "Only remove edges with this exact source-resolution provenance: 'qualified' or 'unqualified'" },
+    link_source_is_null: { type: 'boolean', description: 'Only remove legacy edges whose link source is NULL' },
+    origin_slug_is_null: { type: 'boolean', description: 'Only remove legacy edges whose origin page is NULL' },
+    origin_field_is_null: { type: 'boolean', description: 'Only remove legacy edges whose origin field is NULL' },
+    resolution_type_is_null: { type: 'boolean', description: 'Only remove legacy edges whose resolution type is NULL' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'remove_link', from: p.from, to: p.to };
+    const resolutionType = (p.resolution_type as string) || undefined;
+    if (resolutionType && !['qualified', 'unqualified'].includes(resolutionType)) {
+      throw new Error("resolution_type must be 'qualified' or 'unqualified'");
+    }
+    const linkSourceIsNull = p.link_source_is_null === true;
+    const originSlugIsNull = p.origin_slug_is_null === true;
+    const originFieldIsNull = p.origin_field_is_null === true;
+    const resolutionTypeIsNull = p.resolution_type_is_null === true;
+    if (linkSourceIsNull && p.link_source) throw new Error('link_source and link_source_is_null are mutually exclusive');
+    if (originSlugIsNull && p.origin_slug) throw new Error('origin_slug and origin_slug_is_null are mutually exclusive');
+    if (originFieldIsNull && p.origin_field) throw new Error('origin_field and origin_field_is_null are mutually exclusive');
+    if (resolutionTypeIsNull && resolutionType) throw new Error('resolution_type and resolution_type_is_null are mutually exclusive');
     const linkOpts = ctx.sourceId
       ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId }
       : undefined;
@@ -2030,40 +2201,182 @@ const remove_link: Operation = {
       p.from as string, p.to as string,
       (p.link_type as string) || undefined,
       (p.link_source as string) || undefined,
-      linkOpts,
+      {
+        ...linkOpts,
+        originSourceId: ctx.sourceId,
+        originSlug: (p.origin_slug as string) || undefined,
+        originField: (p.origin_field as string) || undefined,
+        context: p.context === undefined ? undefined : p.context as string,
+        resolutionType: resolutionType as 'qualified' | 'unqualified' | undefined,
+        linkSourceIsNull,
+        originSlugIsNull,
+        originFieldIsNull,
+        resolutionTypeIsNull,
+      },
     );
     return { status: 'ok' };
   },
   cliHints: { name: 'unlink', aliases: ['link-rm'], positional: ['from', 'to'] },
 };
 
-const get_links: Operation = {
-  name: 'get_links',
-  description: 'List outgoing links from a page',
+const restore_link_exact: Operation = {
+  name: 'restore_link_exact',
+  description: 'Local-admin rollback primitive that restores one exact link identity, including managed or NULL provenance.',
+  params: {
+    from: { type: 'string', required: true },
+    to: { type: 'string', required: true },
+    link_type: { type: 'string', required: true },
+    context: { type: 'string', required: true },
+    link_source: { type: 'string' },
+    link_source_is_null: { type: 'boolean' },
+    origin_slug: { type: 'string' },
+    origin_slug_is_null: { type: 'boolean' },
+    origin_field: { type: 'string' },
+    origin_field_is_null: { type: 'boolean' },
+    resolution_type: { type: 'string' },
+    resolution_type_is_null: { type: 'boolean' },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    const edge = parseExactLinkIdentity(p);
+    const sourceId = ctx.sourceId || 'default';
+    if (ctx.dryRun) return { dry_run: true, action: 'restore_link_exact', edge };
+    await ctx.engine.restoreLinkExact(edge, { sourceId });
+    const links = await ctx.engine.getLinks(edge.from_slug, {
+      sourceIds: [sourceId],
+      includeDeleted: true,
+    });
+    const matches = links.filter((link) => linkIdentityMatches(link, edge));
+    if (matches.length !== 1) {
+      throw new OperationError('storage_error', `restore_link_exact readback mismatch for ${edge.from_slug} -> ${edge.to_slug}`);
+    }
+    return { status: 'restored', edge };
+  },
+};
+
+const EXACT_METADATA_KEYS = new Set([
+  'status',
+  'memory_tier',
+  'retrieval_tier',
+  'retrieval_weight',
+  'retrieval_surface',
+  'retained_as_evidence',
+  'decay_state',
+  'governance_retention_class',
+  'governance_last_checked',
+  'governance_policy_version',
+  'governance_reason',
+  'governance_mutation_log',
+]);
+
+const patch_page_metadata_exact: Operation = {
+  name: 'patch_page_metadata_exact',
+  description: 'Local-admin hash-gated patch of governance frontmatter only, without page-version or retrieval side effects.',
   params: {
     slug: { type: 'string', required: true },
+    expected_content_hash: { type: 'string', required: true },
+    patch: { type: 'object', required: true },
+    unset: { type: 'array', items: { type: 'string' } },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    const slug = requireExactString(p, 'slug');
+    const expectedContentHash = requireExactString(p, 'expected_content_hash');
+    if (!p.patch || typeof p.patch !== 'object' || Array.isArray(p.patch)) {
+      throw new OperationError('invalid_params', 'patch must be an object');
+    }
+    const patch = p.patch as Record<string, unknown>;
+    let jsonPatch: Record<string, unknown>;
+    try {
+      jsonPatch = JSON.parse(JSON.stringify(patch)) as Record<string, unknown>;
+    } catch {
+      throw new OperationError('invalid_params', 'patch must contain only JSON-serializable values');
+    }
+    if (!isDeepStrictEqual(jsonPatch, patch)) {
+      throw new OperationError('invalid_params', 'patch must contain only exact JSON values');
+    }
+    const unsetRaw = p.unset ?? [];
+    if (!Array.isArray(unsetRaw) || unsetRaw.some((key) => typeof key !== 'string')) {
+      throw new OperationError('invalid_params', 'unset must be an array of metadata key strings');
+    }
+    const unset = unsetRaw as string[];
+    if (new Set(unset).size !== unset.length) {
+      throw new OperationError('invalid_params', 'unset must not contain duplicate keys');
+    }
+    for (const [key, value] of Object.entries(patch)) {
+      if (!EXACT_METADATA_KEYS.has(key)) throw new OperationError('invalid_params', `metadata key is not allowed: ${key}`);
+      if (value === null) throw new OperationError('invalid_params', `patch.${key} cannot be null; use unset for deletion`);
+      if (unset.includes(key)) throw new OperationError('invalid_params', `metadata key cannot be set and unset: ${key}`);
+    }
+    for (const key of unset) {
+      if (!EXACT_METADATA_KEYS.has(key)) throw new OperationError('invalid_params', `metadata key is not allowed in unset: ${key}`);
+    }
+    if (Object.keys(patch).length === 0 && unset.length === 0) {
+      throw new OperationError('invalid_params', 'patch or unset must contain at least one metadata key');
+    }
+    const sourceId = ctx.sourceId || 'default';
+    if (ctx.dryRun) return { dry_run: true, action: 'patch_page_metadata_exact', slug, patch, unset };
+    const result = await ctx.engine.patchPageMetadataExact(
+      slug,
+      expectedContentHash,
+      { patch, unset },
+      { sourceId },
+    );
+    const readback = await ctx.engine.getPage(slug, { sourceId });
+    if (!readback) throw new OperationError('storage_error', `patch_page_metadata_exact readback missing for ${slug}`);
+    const expectedFrontmatter = { ...(result.before.frontmatter || {}), ...patch };
+    for (const key of unset) delete expectedFrontmatter[key];
+    const semanticUnchanged = readback.type === result.before.type
+      && readback.title === result.before.title
+      && readback.compiled_truth === result.before.compiled_truth
+      && readback.timeline === result.before.timeline;
+    if (!semanticUnchanged || !isDeepStrictEqual(readback.frontmatter, expectedFrontmatter)
+      || readback.content_hash !== result.content_hash) {
+      throw new OperationError('storage_error', `patch_page_metadata_exact readback mismatch for ${slug}`);
+    }
+    return { status: 'patched', slug, content_hash: result.content_hash, patch, unset };
+  },
+};
+
+const get_links: Operation = {
+  name: 'get_links',
+  description: 'List outgoing links from a page. Soft-deleted endpoints are hidden by default.',
+  params: {
+    slug: { type: 'string', required: true },
+    include_deleted: { type: 'boolean', description: 'Include links whose source or target page is soft-deleted (default: false). Intended for recovery and cleanup.' },
   },
   handler: async (ctx, p) => {
     // #2200: linkReadScopeOpts so a federated grant — and an untrusted remote
     // scalar scope (promoted to sourceIds[]) — reaches the engine's all-endpoint
     // branch. Trusted local/internal callers keep the scalar cross-source view.
     const sourceOpts = linkReadScopeOpts(ctx);
-    return ctx.engine.getLinks(p.slug as string, sourceOpts);
+    return ctx.engine.getLinks(p.slug as string, {
+      ...sourceOpts,
+      includeDeleted: (p.include_deleted as boolean) === true,
+    });
   },
   scope: 'read',
 };
 
 const get_backlinks: Operation = {
   name: 'get_backlinks',
-  description: 'List incoming links to a page',
+  description: 'List incoming links to a page. Soft-deleted endpoints are hidden by default.',
   params: {
     slug: { type: 'string', required: true },
+    include_deleted: { type: 'boolean', description: 'Include links whose source or target page is soft-deleted (default: false). Intended for recovery and cleanup.' },
   },
   handler: async (ctx, p) => {
     // #2200: linkReadScopeOpts — federated grant + untrusted remote scalar
     // (promoted to sourceIds[]) reach the engine's all-endpoint branch.
     const sourceOpts = linkReadScopeOpts(ctx);
-    return ctx.engine.getBacklinks(p.slug as string, sourceOpts);
+    return ctx.engine.getBacklinks(p.slug as string, {
+      ...sourceOpts,
+      includeDeleted: (p.include_deleted as boolean) === true,
+    });
   },
   scope: 'read',
   cliHints: { name: 'backlinks', positional: ['slug'] },
@@ -2610,9 +2923,13 @@ const resolve_slugs: Operation = {
   description: 'Fuzzy-resolve a partial slug to matching page slugs',
   params: {
     partial: { type: 'string', required: true },
+    include_deleted: { type: 'boolean', description: 'Include soft-deleted pages (default: false). Intended for recovery and cleanup.' },
   },
   handler: async (ctx, p) => {
-    return ctx.engine.resolveSlugs(p.partial as string);
+    return ctx.engine.resolveSlugs(p.partial as string, {
+      ...sourceScopeOpts(ctx),
+      includeDeleted: (p.include_deleted as boolean) === true,
+    });
   },
   scope: 'read',
 };
@@ -5327,7 +5644,7 @@ const chronicle_backfill: Operation = {
 
 export const operations: Operation[] = [
   // Page CRUD
-  get_page, put_page, delete_page, list_pages,
+  get_page, put_page, put_page_file_exact, patch_page_metadata_exact, delete_page, list_pages,
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)
   restore_page, purge_deleted_pages,
   // Search
@@ -5337,7 +5654,7 @@ export const operations: Operation[] = [
   // Tags
   add_tag, remove_tag, get_tags,
   // Links
-  add_link, remove_link, get_links, get_backlinks, list_link_sources, traverse_graph,
+  add_link, remove_link, restore_link_exact, get_links, get_backlinks, list_link_sources, traverse_graph,
   // Timeline
   add_timeline_entry, get_timeline,
   // Admin

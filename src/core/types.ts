@@ -1189,6 +1189,8 @@ export interface Link {
    * 'investors'). Used for debug output and the `unresolved` response list.
    */
   origin_field?: string | null;
+  /** Whether the original reference explicitly qualified its target source. */
+  resolution_type?: 'qualified' | 'unqualified' | null;
 }
 
 export interface GraphNode {
