@@ -5,12 +5,14 @@ import path from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import type { BrainEngine } from './engine.ts';
 
-const POLICY_VERSION = 'gbrain-exact-corpus-remediation-v1-2026-08-27';
-const BACKUP_SCHEMA = 'gbrain-purge-pages-exact-backup-v1';
-const PLAN_SCHEMA = 'gbrain-purge-pages-exact-plan-v1';
-const APPLY_SCHEMA = 'gbrain-purge-pages-exact-apply-v1';
-const VERIFY_SCHEMA = 'gbrain-purge-pages-exact-verify-v1';
-const ROLLBACK_SCHEMA = 'gbrain-purge-pages-exact-rollback-v1';
+const POLICY_VERSION = 'gbrain-exact-corpus-remediation-v2-2026-08-28';
+const BACKUP_SCHEMA = 'gbrain-purge-pages-exact-backup-v2';
+const PLAN_SCHEMA = 'gbrain-purge-pages-exact-plan-v2';
+const APPLY_SCHEMA = 'gbrain-purge-pages-exact-apply-v2';
+const VERIFY_SCHEMA = 'gbrain-purge-pages-exact-verify-v2';
+const ROLLBACK_SCHEMA = 'gbrain-purge-pages-exact-rollback-v2';
+const MINIMUM_DELETED_AGE_DAYS = 3;
+const MAX_BACKUP_BYTES = 64 * 1024 * 1024;
 
 export interface PurgeAllowlistEntry {
   slug: string;
@@ -181,6 +183,8 @@ function policyShape(args: PurgePagesExactArgs): Record<string, unknown> {
     policy_version: POLICY_VERSION,
     source_id: args.sourceId,
     run_id: args.runId,
+    minimum_deleted_age_days: MINIMUM_DELETED_AGE_DAYS,
+    maximum_backup_bytes: MAX_BACKUP_BYTES,
   };
 }
 
@@ -261,6 +265,17 @@ async function pagesByIds(engine: BrainEngine, ids: number[]): Promise<JsonRow[]
       FROM pages p
      WHERE p.id = ANY($1::int[])
      ORDER BY p.id
+  `, [ids]);
+}
+
+async function pagesByIdsForUpdate(engine: BrainEngine, ids: number[]): Promise<JsonRow[]> {
+  if (ids.length === 0) return [];
+  return jsonRows(engine, `
+    SELECT to_jsonb(p) AS row_json
+      FROM pages p
+     WHERE p.id = ANY($1::int[])
+     ORDER BY p.id
+     FOR UPDATE OF p
   `, [ids]);
 }
 
@@ -349,6 +364,89 @@ function assertAllowlistMatchesPages(entries: PurgeAllowlistEntry[], pages: Json
   }
 }
 
+async function assertMinimumDeletedAge(engine: BrainEngine, pages: JsonRow[]): Promise<void> {
+  const pageIds = numericIds(pages);
+  const tooYoung = await engine.executeRaw<{ slug: string }>(`
+    SELECT slug FROM pages
+     WHERE id = ANY($1::int[])
+       AND (deleted_at IS NULL OR deleted_at > now() - interval '3 days')
+     ORDER BY slug
+  `, [pageIds]);
+  if (tooYoung.length > 0) {
+    throw new Error(`purge target is younger than ${MINIMUM_DELETED_AGE_DAYS} days: ${tooYoung[0].slug}`);
+  }
+}
+
+interface ActiveDependencyCounts {
+  inbound_links: number;
+  origin_links: number;
+  timeline_events: number;
+  synthesis_evidence: number;
+  slug_aliases: number;
+  total: number;
+}
+
+async function countQuery(engine: BrainEngine, sql: string, params: unknown[]): Promise<number> {
+  const [row] = await engine.executeRaw<{ count: number | string }>(sql, params);
+  return Number(row?.count || 0);
+}
+
+async function activeDependencyCounts(
+  engine: BrainEngine,
+  sourceId: string,
+  pageIds: number[],
+  slugs: string[],
+): Promise<ActiveDependencyCounts> {
+  const inboundLinks = await countQuery(engine, `
+    SELECT count(*)::bigint AS count
+      FROM links l
+      JOIN pages referrer ON referrer.id = l.from_page_id
+     WHERE l.to_page_id = ANY($1::int[]) AND referrer.deleted_at IS NULL
+  `, [pageIds]);
+  const originLinks = await countQuery(engine, `
+    SELECT count(*)::bigint AS count
+      FROM links l
+      JOIN pages source_page ON source_page.id = l.from_page_id
+      JOIN pages target_page ON target_page.id = l.to_page_id
+     WHERE l.origin_page_id = ANY($1::int[])
+       AND (source_page.deleted_at IS NULL OR target_page.deleted_at IS NULL)
+  `, [pageIds]);
+  const timelineEvents = await countQuery(engine, `
+    SELECT count(*)::bigint AS count
+      FROM timeline_entries t
+      JOIN pages owner ON owner.id = t.page_id
+     WHERE t.event_page_id = ANY($1::int[]) AND owner.deleted_at IS NULL
+  `, [pageIds]);
+  const synthesisEvidence = await tableExists(engine, 'synthesis_evidence')
+    ? await countQuery(engine, `
+        SELECT count(*)::bigint AS count
+          FROM synthesis_evidence s
+          JOIN pages synthesis ON synthesis.id = s.synthesis_page_id
+         WHERE s.take_page_id = ANY($1::int[]) AND synthesis.deleted_at IS NULL
+      `, [pageIds])
+    : 0;
+  const slugAliases = await tableExists(engine, 'slug_aliases')
+    ? await countQuery(engine, `
+        SELECT count(*)::bigint AS count FROM slug_aliases
+         WHERE source_id = $1 AND canonical_slug = ANY($2::text[])
+      `, [sourceId, slugs])
+    : 0;
+  return {
+    inbound_links: inboundLinks,
+    origin_links: originLinks,
+    timeline_events: timelineEvents,
+    synthesis_evidence: synthesisEvidence,
+    slug_aliases: slugAliases,
+    total: inboundLinks + originLinks + timelineEvents + synthesisEvidence + slugAliases,
+  };
+}
+
+function assertNoActiveDependencies(counts: ActiveDependencyCounts): void {
+  if (counts.total !== 0) {
+    throw new Error(`purge active dependency gate failed: ${stableJson(counts)}`);
+  }
+}
+
 function assertPageIdentitiesMatchBackup(current: JsonRow[], expected: JsonRow[], sourceId: string): void {
   const byId = new Map(current.map((page) => [Number(page.id), page]));
   for (const backupPage of expected) {
@@ -368,10 +466,14 @@ function assertPageIdentitiesMatchBackup(current: JsonRow[], expected: JsonRow[]
 
 async function loadBackup(args: PurgePagesExactArgs): Promise<{ bytes: Buffer; payload: PurgeBackup }> {
   const file = artifact(args, 'backup.json.gz');
-  const mode = (await stat(file)).mode & 0o777;
+  const metadata = await stat(file);
+  const mode = metadata.mode & 0o777;
   if (mode !== 0o600) throw new Error('purge backup must have mode 0600');
+  if (metadata.size > MAX_BACKUP_BYTES) throw new Error('purge backup compressed payload exceeds maximum size');
   const bytes = await readFile(file);
-  return { bytes, payload: JSON.parse(gunzipSync(bytes).toString('utf8')) as PurgeBackup };
+  const uncompressed = gunzipSync(bytes, { maxOutputLength: MAX_BACKUP_BYTES });
+  if (uncompressed.byteLength > MAX_BACKUP_BYTES) throw new Error('purge backup payload exceeds maximum size');
+  return { bytes, payload: JSON.parse(uncompressed.toString('utf8')) as PurgeBackup };
 }
 
 function publicPlan(report: any): Record<string, unknown> {
@@ -401,15 +503,20 @@ async function plan(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Rec
     return publicPlan(prior);
   }
 
-  await mkdir(backupRoot(), { recursive: true, mode: 0o700 });
-  await chmod(backupRoot(), 0o700);
-  await syncDirectory(path.dirname(backupRoot()));
-  await mkdir(runDir(args), { mode: 0o700 });
-  await syncDirectory(backupRoot());
-
-  const pages = await pagesBySourceSlugs(engine, args.sourceId, entries.map((entry) => entry.slug));
-  assertAllowlistMatchesPages(entries, pages, args.sourceId);
-  const graph = await captureGraph(engine, pages);
+  const snapshot = await engine.transaction(async (tx) => {
+    if (tx.kind === 'postgres') {
+      await tx.executeRaw('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+    }
+    const pages = await pagesBySourceSlugs(tx, args.sourceId, entries.map((entry) => entry.slug));
+    assertAllowlistMatchesPages(entries, pages, args.sourceId);
+    await assertMinimumDeletedAge(tx, pages);
+    const dependencyCounts = await activeDependencyCounts(
+      tx, args.sourceId, numericIds(pages), entries.map((entry) => entry.slug),
+    );
+    assertNoActiveDependencies(dependencyCounts);
+    return { pages, graph: await captureGraph(tx, pages), dependencyCounts };
+  });
+  const { pages, graph, dependencyCounts } = snapshot;
   const graphFingerprint = fingerprint(graph);
   const backup: PurgeBackup = {
     schema_version: BACKUP_SCHEMA,
@@ -419,8 +526,21 @@ async function plan(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Rec
     graph_fingerprint: graphFingerprint,
     rows: graph,
   };
-  const backupBytes = gzipSync(`${JSON.stringify(normalize(backup))}\n`, { level: 9 });
+  const backupPayload = Buffer.from(`${JSON.stringify(normalize(backup))}\n`);
+  if (backupPayload.byteLength > MAX_BACKUP_BYTES) {
+    throw new Error('purge backup payload exceeds maximum size');
+  }
+  const backupBytes = gzipSync(backupPayload, { level: 9 });
+  if (backupBytes.byteLength > MAX_BACKUP_BYTES) {
+    throw new Error('purge backup compressed payload exceeds maximum size');
+  }
   const backupSha256 = sha256(backupBytes);
+
+  await mkdir(backupRoot(), { recursive: true, mode: 0o700 });
+  await chmod(backupRoot(), 0o700);
+  await syncDirectory(path.dirname(backupRoot()));
+  await mkdir(runDir(args), { mode: 0o700 });
+  await syncDirectory(backupRoot());
   await atomicWrite(artifact(args, 'backup.json.gz'), backupBytes, true);
   const report = {
     schema_version: PLAN_SCHEMA,
@@ -431,6 +551,9 @@ async function plan(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Rec
     allowlist_fingerprint: allowlistFingerprint,
     graph_fingerprint: graphFingerprint,
     backup_sha256: backupSha256,
+    backup_payload_bytes: backupPayload.byteLength,
+    backup_compressed_bytes: backupBytes.byteLength,
+    active_dependency_counts: dependencyCounts,
     backup_row_counts: Object.fromEntries(Object.entries(graph).map(([key, rows]) => [key, rows.length])),
     page_ids: numericIds(pages),
   };
@@ -449,6 +572,113 @@ function assertPlanAndBackup(planReport: any, backup: PurgeBackup, backupBytes: 
     || planReport.backup_sha256 !== sha256(backupBytes)) {
     throw new Error('purge plan or backup integrity mismatch');
   }
+}
+
+async function optionalResidualCount(
+  engine: BrainEngine,
+  table: string,
+  sql: string,
+  params: unknown[],
+  expectedRows: number,
+): Promise<number> {
+  if (!(await tableExists(engine, table))) {
+    if (expectedRows > 0) throw new Error(`purge verification table missing: ${table}`);
+    return 0;
+  }
+  return countQuery(engine, sql, params);
+}
+
+interface PurgeGraphVerification {
+  status: 'pass' | 'blocked';
+  residual_counts: Record<string, number>;
+  residual_row_count: number;
+  set_null_expected_count: number;
+  set_null_verified_count: number;
+  set_null_drift_count: number;
+}
+
+async function verifyPurgedGraph(engine: BrainEngine, backup: PurgeBackup): Promise<PurgeGraphVerification> {
+  const pageIds = numericIds(backup.rows.pages);
+  const slugs = backup.rows.pages.map((page) => String(page.slug));
+  const chunkIds = numericIds(backup.rows.content_chunks);
+  const residualCounts: Record<string, number> = {
+    pages_by_id: (await pagesByIds(engine, pageIds)).length,
+    pages_by_slug: (await pagesBySourceSlugs(engine, backup.source_id, slugs)).length,
+    content_chunks: await countQuery(engine,
+      `SELECT count(*)::bigint AS count FROM content_chunks WHERE page_id = ANY($1::int[])`, [pageIds]),
+    links: await countQuery(engine,
+      `SELECT count(*)::bigint AS count FROM links WHERE from_page_id = ANY($1::int[]) OR to_page_id = ANY($1::int[])`, [pageIds]),
+    tags: await countQuery(engine,
+      `SELECT count(*)::bigint AS count FROM tags WHERE page_id = ANY($1::int[])`, [pageIds]),
+    raw_data: await countQuery(engine,
+      `SELECT count(*)::bigint AS count FROM raw_data WHERE page_id = ANY($1::int[])`, [pageIds]),
+    timeline_entries: await countQuery(engine,
+      `SELECT count(*)::bigint AS count FROM timeline_entries WHERE page_id = ANY($1::int[]) OR event_page_id = ANY($1::int[])`, [pageIds]),
+    page_versions: await countQuery(engine,
+      `SELECT count(*)::bigint AS count FROM page_versions WHERE page_id = ANY($1::int[])`, [pageIds]),
+    code_edges_chunk: chunkIds.length === 0 ? 0 : await optionalResidualCount(
+      engine, 'code_edges_chunk',
+      `SELECT count(*)::bigint AS count FROM code_edges_chunk WHERE from_chunk_id = ANY($1::int[]) OR to_chunk_id = ANY($1::int[])`,
+      [chunkIds], backup.rows.code_edges_chunk.length,
+    ),
+    code_edges_symbol: chunkIds.length === 0 ? 0 : await optionalResidualCount(
+      engine, 'code_edges_symbol',
+      `SELECT count(*)::bigint AS count FROM code_edges_symbol WHERE from_chunk_id = ANY($1::int[])`,
+      [chunkIds], backup.rows.code_edges_symbol.length,
+    ),
+    takes: await optionalResidualCount(
+      engine, 'takes', `SELECT count(*)::bigint AS count FROM takes WHERE page_id = ANY($1::int[])`,
+      [pageIds], backup.rows.takes.length,
+    ),
+    synthesis_evidence: await optionalResidualCount(
+      engine, 'synthesis_evidence',
+      `SELECT count(*)::bigint AS count FROM synthesis_evidence WHERE synthesis_page_id = ANY($1::int[]) OR take_page_id = ANY($1::int[])`,
+      [pageIds], backup.rows.synthesis_evidence.length,
+    ),
+    page_aliases: await optionalResidualCount(
+      engine, 'page_aliases',
+      `SELECT count(*)::bigint AS count FROM page_aliases WHERE source_id = $1 AND slug = ANY($2::text[])`,
+      [backup.source_id, slugs], backup.rows.page_aliases.length,
+    ),
+    slug_aliases: await optionalResidualCount(
+      engine, 'slug_aliases',
+      `SELECT count(*)::bigint AS count FROM slug_aliases WHERE source_id = $1
+        AND (alias_slug = ANY($2::text[]) OR canonical_slug = ANY($2::text[]))`,
+      [backup.source_id, slugs], backup.rows.slug_aliases.length,
+    ),
+  };
+
+  let setNullVerified = 0;
+  let setNullDrift = 0;
+  for (const file of backup.rows.files) {
+    const current = await optionalJsonRows(engine, 'files',
+      `SELECT to_jsonb(f) AS row_json FROM files f WHERE f.id = $1::int`, [Number(file.id)]);
+    if (current.length === 1 && current[0].page_id === null
+      && stableJson(without(current[0], 'page_id')) === stableJson(without(file, 'page_id'))) {
+      setNullVerified += 1;
+    } else {
+      setNullDrift += 1;
+    }
+  }
+  for (const link of backup.rows.origin_only_links) {
+    const current = await jsonRows(engine,
+      `SELECT to_jsonb(l) AS row_json FROM links l WHERE l.id = $1::int`, [Number(link.id)]);
+    if (current.length === 1 && current[0].origin_page_id === null
+      && stableJson(without(current[0], 'origin_page_id')) === stableJson(without(link, 'origin_page_id'))) {
+      setNullVerified += 1;
+    } else {
+      setNullDrift += 1;
+    }
+  }
+  const residualRowCount = Object.values(residualCounts).reduce((sum, count) => sum + count, 0);
+  return {
+    status: residualRowCount === 0 && setNullDrift === 0 ? 'pass' : 'blocked',
+    residual_counts: residualCounts,
+    residual_row_count: residualRowCount,
+    set_null_expected_count: backup.rows.files.length + backup.rows.origin_only_links.length,
+    set_null_verified_count: setNullVerified,
+    set_null_drift_count: setNullDrift,
+  };
 }
 
 async function finishApply(
@@ -499,13 +729,12 @@ async function apply(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Re
   const slugs = backup.rows.pages.map((page) => String(page.slug));
   if (prior) {
     assertPolicy(prior, args);
-    const byIds = await pagesByIds(engine, pageIds);
-    const bySlugs = await pagesBySourceSlugs(engine, args.sourceId, slugs);
+    const verification = await verifyPurgedGraph(engine, backup);
     if (prior.schema_version !== APPLY_SCHEMA || prior.status !== 'pass'
       || prior.allowlist_fingerprint !== planReport.allowlist_fingerprint
       || prior.graph_fingerprint !== planReport.graph_fingerprint
       || prior.backup_sha256 !== planReport.backup_sha256
-      || Number(prior.purged_count) !== pageIds.length || byIds.length !== 0 || bySlugs.length !== 0) {
+      || Number(prior.purged_count) !== pageIds.length || verification.status !== 'pass') {
       throw new Error('existing purge apply artifact does not match database state');
     }
     return prior;
@@ -513,17 +742,14 @@ async function apply(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Re
 
   const currentPages = await pagesByIds(engine, pageIds);
   if (currentPages.length === 0) {
-    const bySlugs = await pagesBySourceSlugs(engine, args.sourceId, slugs);
-    if (bySlugs.length !== 0) throw new Error('purge targets were recreated with new identities');
+    const verification = await verifyPurgedGraph(engine, backup);
+    if (verification.status !== 'pass') throw new Error('purge targets are absent but dependent graph verification failed');
     if (!args.acceptAmbiguousCommit) {
       throw new Error('all purge targets are absent without an apply artifact; retry with accept_ambiguous_commit=true after operator review');
     }
     return finishApply(args, planReport, pageIds.length, true);
   }
   if (currentPages.length !== pageIds.length) throw new Error('purge targets are partially absent');
-  assertPageIdentitiesMatchBackup(currentPages, backup.rows.pages, args.sourceId);
-  const currentGraph = await captureGraph(engine, currentPages);
-  if (fingerprint(currentGraph) !== planReport.graph_fingerprint) throw new Error('purge target graph drifted after plan');
 
   await writeJson(artifact(args, 'apply-intent.json'), {
     schema_version: 'gbrain-purge-pages-exact-apply-intent-v1',
@@ -545,6 +771,19 @@ async function apply(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Re
 
   try {
     await engine.transaction(async (tx) => {
+      if (tx.kind === 'postgres') {
+        await tx.executeRaw('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+      }
+      const lockedPages = await pagesByIdsForUpdate(tx, pageIds);
+      if (lockedPages.length !== pageIds.length) throw new Error('purge targets became partially absent');
+      assertPageIdentitiesMatchBackup(lockedPages, backup.rows.pages, args.sourceId);
+      await assertMinimumDeletedAge(tx, lockedPages);
+      const dependencies = await activeDependencyCounts(tx, args.sourceId, pageIds, slugs);
+      assertNoActiveDependencies(dependencies);
+      const currentGraph = await captureGraph(tx, lockedPages);
+      if (fingerprint(currentGraph) !== planReport.graph_fingerprint) {
+        throw new Error('purge target graph drifted after plan');
+      }
       if (await tableExists(tx, 'page_aliases')) {
         await tx.executeRaw(`DELETE FROM page_aliases WHERE source_id = $1 AND slug = ANY($2::text[])`, [args.sourceId, slugs]);
       }
@@ -557,6 +796,7 @@ async function apply(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Re
           DELETE FROM pages
            WHERE id = $1::int AND source_id = $2 AND slug = $3
              AND deleted_at = $4::timestamptz AND content_hash = $5
+             AND deleted_at <= now() - interval '3 days'
            RETURNING id
         `, [Number(page.id), args.sourceId, page.slug, page.deleted_at, page.content_hash]);
         if (deleted.length !== 1) throw new Error(`purge delete identity mismatch for ${String(page.slug)}`);
@@ -565,6 +805,10 @@ async function apply(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Re
   } catch (error) {
     const remaining = await pagesByIds(engine, pageIds);
     if (remaining.length === 0) {
+      const verification = await verifyPurgedGraph(engine, backup);
+      if (verification.status !== 'pass') {
+        throw new Error('ambiguous purge commit left dependent graph drift', { cause: error });
+      }
       if (!args.acceptAmbiguousCommit) {
         throw new Error('ambiguous purge commit requires accept_ambiguous_commit=true after operator review', { cause: error });
       }
@@ -573,9 +817,8 @@ async function apply(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Re
     if (remaining.length !== pageIds.length) throw new Error('ambiguous partial purge state', { cause: error });
     throw error;
   }
-  const remainingById = await pagesByIds(engine, pageIds);
-  const remainingBySlug = await pagesBySourceSlugs(engine, args.sourceId, slugs);
-  if (remainingById.length !== 0 || remainingBySlug.length !== 0) throw new Error('purge readback mismatch');
+  const verification = await verifyPurgedGraph(engine, backup);
+  if (verification.status !== 'pass') throw new Error('purge dependent graph readback mismatch');
   return finishApply(args, planReport, pageIds.length, false);
 }
 
@@ -586,11 +829,7 @@ async function verify(engine: BrainEngine, args: PurgePagesExactArgs): Promise<R
   assertPlanAndBackup(planReport, backup, bytes, args);
   assertPolicy(applyReport, args);
   const pageIds = numericIds(backup.rows.pages);
-  const slugs = backup.rows.pages.map((page) => String(page.slug));
-  const byIds = await pagesByIds(engine, pageIds);
-  const bySlugs = await pagesBySourceSlugs(engine, args.sourceId, slugs);
-  const aliases = (await captureGraph(engine, backup.rows.pages.map((page) => ({ ...page, id: -Number(page.id) }))));
-  const aliasCount = aliases.page_aliases.length + aliases.slug_aliases.length;
+  const graphVerification = await verifyPurgedGraph(engine, backup);
   if (applyReport.schema_version !== APPLY_SCHEMA || applyReport.status !== 'pass'
     || applyReport.allowlist_fingerprint !== planReport.allowlist_fingerprint
     || applyReport.graph_fingerprint !== planReport.graph_fingerprint
@@ -602,7 +841,7 @@ async function verify(engine: BrainEngine, args: PurgePagesExactArgs): Promise<R
   if (prior) {
     assertPolicy(prior, args);
     if (prior.schema_version !== VERIFY_SCHEMA || prior.status !== 'pass'
-      || byIds.length !== 0 || bySlugs.length !== 0 || aliasCount !== 0) {
+      || graphVerification.status !== 'pass') {
       throw new Error('existing purge verify artifact does not match database state');
     }
     return prior;
@@ -611,11 +850,9 @@ async function verify(engine: BrainEngine, args: PurgePagesExactArgs): Promise<R
     schema_version: VERIFY_SCHEMA,
     ...policyShape(args),
     generated_at: nowIso(),
-    status: byIds.length === 0 && bySlugs.length === 0 && aliasCount === 0 ? 'pass' : 'blocked',
     allowlist_fingerprint: planReport.allowlist_fingerprint,
-    verified_absent_count: pageIds.length - byIds.length,
-    recreated_slug_count: bySlugs.length,
-    residual_alias_count: aliasCount,
+    verified_absent_count: pageIds.length - graphVerification.residual_counts.pages_by_id,
+    ...graphVerification,
   };
   await writeJson(artifact(args, 'verify.json'), result, true);
   if (result.status !== 'pass') throw new Error('purge verification failed');

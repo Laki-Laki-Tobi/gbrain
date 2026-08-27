@@ -275,6 +275,13 @@ export async function importFromContent(
      */
     forceRechunk?: boolean;
     /**
+     * Local-admin exact remediation only. Use a plain INSERT for the page row
+     * so the database uniqueness constraint is the atomic create-only gate.
+     * A concurrent creator wins or loses; this path never enters putPage's
+     * ON CONFLICT UPDATE branch.
+     */
+    createOnly?: boolean;
+    /**
      * v0.39.0.0 T1.5: active schema pack for type inference. When set, parseMarkdown
      * uses the pack's path_prefixes instead of the hardcoded gbrain-base table.
      * When unset, falls back to pre-v0.39 behavior (parity gate stays green).
@@ -566,6 +573,9 @@ export async function importFromContent(
   const hash = computeImportContentHash(parsedPage);
 
   const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
+  if (opts.createOnly && existing) {
+    throw new Error(`[import] create-only page already exists: ${sourceId ?? 'default'}/${slug}`);
+  }
   if (existing?.content_hash === hash && !opts.forceRechunk) {
     return { slug, status: 'skipped', chunks: 0, parsedPage };
   }
@@ -756,7 +766,7 @@ export async function importFromContent(
       createdAt: existing?.created_at ?? nowDate,
     });
 
-    await tx.putPage(slug, {
+    const pageInput = {
       type: parsed.type,
       title: parsed.title,
       compiled_truth: parsed.compiled_truth,
@@ -780,7 +790,35 @@ export async function importFromContent(
       ingested_via: opts.ingested_via ?? null,
       // ingested_at is server-stamped at the engine layer when any
       // provenance write fires; never client-controlled.
-    }, txOpts);
+    };
+    if (opts.createOnly) {
+      const created = await tx.executeRaw<{ id: number | string }>(`
+        INSERT INTO pages (
+          source_id, slug, type, page_kind, title, compiled_truth, timeline,
+          frontmatter, content_hash, updated_at, effective_date,
+          effective_date_source, import_filename, chunker_version, source_path,
+          source_kind, source_uri, ingested_via, ingested_at
+        ) VALUES (
+          $1, $2, $3, 'markdown', $4, $5, $6, $7::text::jsonb, $8, now(),
+          $9::timestamptz, $10, $11, COALESCE($12::smallint, 1), $13,
+          $14, $15, $16,
+          CASE WHEN $14::text IS NOT NULL OR $15::text IS NOT NULL OR $16::text IS NOT NULL
+               THEN now() ELSE NULL END
+        )
+        RETURNING id
+      `, [
+        sourceId ?? 'default', slug, pageInput.type, pageInput.title,
+        pageInput.compiled_truth, pageInput.timeline,
+        JSON.stringify(pageInput.frontmatter), pageInput.content_hash,
+        pageInput.effective_date, pageInput.effective_date_source,
+        pageInput.import_filename, pageInput.chunker_version,
+        pageInput.source_path, pageInput.source_kind, pageInput.source_uri,
+        pageInput.ingested_via,
+      ]);
+      if (created.length !== 1) throw new Error(`[import] create-only insert failed: ${sourceId ?? 'default'}/${slug}`);
+    } else {
+      await tx.putPage(slug, pageInput, txOpts);
+    }
 
     // v0.40.3.0: stamp the contextual retrieval state columns alongside
     // the page write. updatePageContextualRetrievalState is a narrow
@@ -817,6 +855,14 @@ export async function importFromContent(
     // (ON CONFLICT DO NOTHING), so re-adding existing tags is a no-op.
     for (const tag of parsed.tags) {
       await tx.addTag(slug, tag, txOpts);
+    }
+
+    // Exact create treats aliases as part of the atomic page projection.
+    // Normal imports retain the historical fail-soft post-commit behavior
+    // below for compatibility with pre-v110 brains.
+    if (opts.createOnly) {
+      const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
+      await tx.setPageAliases(slug, sourceId ?? 'default', aliasNorms);
     }
 
     if (chunks.length > 0) {
@@ -878,15 +924,17 @@ export async function importFromContent(
   // import. Always called (even with []) so REMOVING an alias from frontmatter
   // clears its row — the content_hash includes non-timestamp frontmatter, so
   // an alias edit changes the hash and reaches this path (not the skip branch).
-  try {
-    const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
-    await engine.setPageAliases(slug, sourceId ?? 'default', aliasNorms);
-  } catch (e) {
-    if (!isUndefinedTableError(e)) {
-      warnOncePerProcess(
-        'setPageAliases:failed',
-        `[import] page_aliases projection failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
-      );
+  if (!opts.createOnly) {
+    try {
+      const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
+      await engine.setPageAliases(slug, sourceId ?? 'default', aliasNorms);
+    } catch (e) {
+      if (!isUndefinedTableError(e)) {
+        warnOncePerProcess(
+          'setPageAliases:failed',
+          `[import] page_aliases projection failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
     }
   }
 

@@ -2,6 +2,21 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.5] - 2026-08-28
+
+### Fixed
+- Exact create now uses a database-enforced insert-only canonical path and
+  verifies the complete `page_aliases` projection, preventing a concurrent
+  creator from being overwritten.
+- Exact zero-inbound soft-delete serializes with single and batch link writers;
+  an existing tombstone without durable operation evidence now requires the
+  explicit ambiguous-commit gate.
+- Exact purge enforces a three-day minimum tombstone age and zero active
+  inbound dependencies at plan and atomic apply, captures a consistent bounded
+  backup, and verifies the full cascaded/`SET NULL` dependent graph.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.4] - 2026-08-28
 
 ### Added

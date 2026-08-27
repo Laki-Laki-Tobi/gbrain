@@ -9,11 +9,14 @@ through the local `gbrain call` surface with an explicit source selection.
 - `create_page_file_exact` creates only an absent lowercase slug. The input
   must be an absolute regular UTF-8 file with mode `0600`, and
   `expected_content_sha256` must match its bytes. Canonical ingestion runs
-  without embedding and the resulting page, tags, and content hash are read
+  without embedding. The page row uses a plain insert, so the database unique
+  constraint atomically rejects a concurrent creator instead of entering an
+  upsert path. The resulting page, tags, aliases, and content hash are read
   back exactly.
 - `soft_delete_page_exact` binds the mutation to source, slug, and
   `expected_content_hash`. Set `require_zero_inbound=true` to block while any
-  database backlink exists. Verification uses an include-deleted readback.
+  database backlink exists. Endpoint row locks serialize this gate with both
+  single and batch link writers. Verification uses an include-deleted readback.
 - `restore_page_exact` additionally requires the exact tombstone timestamp in
   `expected_deleted_at`. It verifies the restored active row after clearing
   the tombstone.
@@ -21,13 +24,18 @@ through the local `gbrain call` surface with an explicit source selection.
 Ambiguous create, soft-delete, or restore recovery is fail-closed. Set
 `accept_ambiguous_commit=true` only after independently reviewing the current
 row and confirming that a prior call committed but lost its response.
+An already-soft-deleted row has no operation-local durable evidence by itself
+and therefore also requires this explicit gate.
 
 ## Exact Physical Purge
 
 `purge_pages_exact` accepts actions `plan`, `apply`, `verify`, and `rollback`.
 The plan allowlist contains at most 100 entries, each with lowercase `slug`,
 exact `deleted_at`, and exact `content_hash`. The generated fingerprint binds
-the source and complete allowlist.
+the source and complete allowlist. Every target must have been soft-deleted for
+at least three days and must have zero active inbound links or dependent
+references. Both conditions are checked during planning and again while the
+target rows are locked in the apply transaction.
 
 The plan writes mode-`0600` evidence under:
 
@@ -41,10 +49,20 @@ synthesis evidence, file associations, and page/slug aliases. Files and
 origin-only links that survive the purge through `ON DELETE SET NULL` are
 drift-checked before rollback restores their associations.
 
+Plan capture uses one transaction (`REPEATABLE READ` on Postgres), and apply
+uses a serializable transaction plus target row locks and an exact graph
+fingerprint recheck. Both compressed and uncompressed backup payloads are
+bounded to 64 MiB. The protocol stops before writing a backup if either bound
+is exceeded. Writers outside the engine's canonical link methods are not part
+of the shared endpoint-lock protocol; target row locks, foreign keys, the
+serializable apply, and the final full-graph readback provide the fail-closed
+backstop for that residual case.
+
 Apply and rollback require `apply_enabled=true` plus the plan's
 `allowlist_fingerprint` as `expected_fingerprint`. Missing artifacts,
 partial presence, recreated slugs, source/hash/tombstone drift, backup damage,
-or graph drift stop the operation. `accept_ambiguous_commit=true` is reserved
+graph drift, residual cascade rows, or incorrect `SET NULL` projections stop
+the operation. `accept_ambiguous_commit=true` is reserved
 for an independently reviewed all-committed state after a lost response.
 
 This protocol never invokes `purge_deleted_pages`, performs no migration, and

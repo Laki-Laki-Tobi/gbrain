@@ -415,7 +415,7 @@ describe('exact corpus page operations', () => {
     const op = operationsByName.create_page_file_exact;
     const dir = await mkdtemp(join(tmpdir(), 'gbrain-create-exact-'));
     const filePath = join(dir, 'summary.md');
-    const content = '---\ntype: note\ntitle: Exact summary\ntags:\n  - governance\n---\n\n# Exact summary\n\nBounded semantic content.\n';
+    const content = '---\ntype: note\ntitle: Exact summary\ntags:\n  - governance\naliases:\n  - Exact Alias\n---\n\n# Exact summary\n\nBounded semantic content.\n';
     const fileSha = createHash('sha256').update(content).digest('hex');
     try {
       await writeFile(filePath, content, { mode: 0o600 });
@@ -435,6 +435,10 @@ describe('exact corpus page operations', () => {
       expect(page?.title).toBe('Exact summary');
       expect(page?.compiled_truth).toContain('Bounded semantic content.');
       expect(await engine.getTags('projects/new-summary', { sourceId: 'default' })).toContain('governance');
+      expect(await engine.executeRaw(
+        `SELECT alias_norm FROM page_aliases WHERE source_id = 'default' AND slug = $1`,
+        ['projects/new-summary'],
+      )).toEqual([{ alias_norm: 'exact alias' }]);
 
       await expect(op.handler(ctx(), {
         slug: 'projects/new-summary', expected_content_sha256: fileSha, file_path: filePath,
@@ -444,6 +448,15 @@ describe('exact corpus page operations', () => {
         accept_ambiguous_commit: true,
       }) as any;
       expect(recovered.recovered_after_ambiguous_commit).toBe(true);
+
+      await engine.executeRaw(
+        `DELETE FROM page_aliases WHERE source_id = 'default' AND slug = $1`,
+        ['projects/new-summary'],
+      );
+      await expect(op.handler(ctx(), {
+        slug: 'projects/new-summary', expected_content_sha256: fileSha, file_path: filePath,
+        accept_ambiguous_commit: true,
+      })).rejects.toThrow('absence gate failed');
 
       await engine.executeRaw(
         `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
@@ -486,9 +499,13 @@ describe('exact corpus page operations', () => {
     expect((await engine.getPage(before.slug))).toBeNull();
     const tombstone = (await engine.getPage(before.slug, { includeDeleted: true }))!;
     expect(tombstone.deleted_at).toBeTruthy();
+    await expect(soft.handler(ctx(), {
+      slug: before.slug, expected_content_hash: before.content_hash, require_zero_inbound: true,
+    })).rejects.toThrow('accept_ambiguous_commit=true');
     expect((await soft.handler(ctx(), {
       slug: before.slug, expected_content_hash: before.content_hash, require_zero_inbound: true,
-    }) as any).status).toBe('already_soft_deleted');
+      accept_ambiguous_commit: true,
+    }) as any).recovered_after_ambiguous_commit).toBe(true);
 
     const restore = operationsByName.restore_page_exact;
     await expect(restore.handler(ctx(), {
@@ -509,6 +526,77 @@ describe('exact corpus page operations', () => {
       slug: before.slug, expected_content_hash: before.content_hash,
       expected_deleted_at: tombstone.deleted_at!.toISOString(), accept_ambiguous_commit: true,
     }) as any).recovered_after_ambiguous_commit).toBe(true);
+  });
+
+  test('create-only atomically preserves exactly one concurrent creator', async () => {
+    const op = operationsByName.create_page_file_exact;
+    const dir = await mkdtemp(join(tmpdir(), 'gbrain-create-race-'));
+    const contents = [
+      '---\ntype: note\ntitle: Concurrent alpha\n---\n\n# Concurrent alpha\n\nAlpha body.\n',
+      '---\ntype: note\ntitle: Concurrent beta\n---\n\n# Concurrent beta\n\nBeta body.\n',
+    ];
+    try {
+      const paths = [join(dir, 'alpha.md'), join(dir, 'beta.md')];
+      await Promise.all(paths.map((file, index) => writeFile(file, contents[index], { mode: 0o600 })));
+      const outcomes = await Promise.allSettled(paths.map((file, index) => op.handler(ctx(), {
+        slug: 'projects/concurrent-create',
+        expected_content_sha256: createHash('sha256').update(contents[index]).digest('hex'),
+        file_path: file,
+      })));
+      expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
+      expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1);
+      const stored = await engine.getPage('projects/concurrent-create');
+      if (!stored) throw new Error('concurrent create produced no page');
+      expect(['Concurrent alpha', 'Concurrent beta']).toContain(stored.title);
+      expect(stored.compiled_truth).toBe(stored.title === 'Concurrent alpha' ? '# Concurrent alpha\n\nAlpha body.' : '# Concurrent beta\n\nBeta body.');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('create-only rolls back the page when exact alias projection fails', async () => {
+    const op = operationsByName.create_page_file_exact;
+    const dir = await mkdtemp(join(tmpdir(), 'gbrain-create-alias-fail-'));
+    const file = join(dir, 'alias-fail.md');
+    const content = '---\ntype: note\ntitle: Alias failure\naliases:\n  - Required Alias\n---\n\n# Alias failure\n';
+    const original = engine.setPageAliases;
+    try {
+      await writeFile(file, content, { mode: 0o600 });
+      engine.setPageAliases = async () => { throw new Error('injected alias projection failure'); };
+      await expect(op.handler(ctx(), {
+        slug: 'projects/alias-failure',
+        expected_content_sha256: createHash('sha256').update(content).digest('hex'),
+        file_path: file,
+      })).rejects.toThrow('injected alias projection failure');
+      expect(await engine.getPage('projects/alias-failure', { includeDeleted: true })).toBeNull();
+    } finally {
+      engine.setPageAliases = original;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('zero-inbound soft-delete serializes with a concurrent link insert', async () => {
+    await engine.putPage('projects/race-target', {
+      type: 'note', title: 'Race target', compiled_truth: 'target', timeline: '', frontmatter: {},
+    });
+    await engine.putPage('projects/race-referrer', {
+      type: 'note', title: 'Race referrer', compiled_truth: 'referrer', timeline: '', frontmatter: {},
+    });
+    const target = (await engine.getPage('projects/race-target'))!;
+    const outcomes = await Promise.allSettled([
+      operationsByName.soft_delete_page_exact.handler(ctx(), {
+        slug: target.slug, expected_content_hash: target.content_hash, require_zero_inbound: true,
+      }),
+      engine.addLink('projects/race-referrer', target.slug, 'racing link', 'related', 'manual'),
+    ]);
+    expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1);
+    const after = await engine.getPage(target.slug, { includeDeleted: true });
+    const links = await engine.executeRaw<{ count: number | string }>(
+      `SELECT count(*)::int AS count FROM links WHERE to_page_id = $1::int`, [target.id],
+    );
+    if (after?.deleted_at) expect(Number(links[0].count)).toBe(0);
+    else expect(Number(links[0].count)).toBe(1);
   });
 });
 
@@ -547,6 +635,92 @@ describe('purge_pages_exact', () => {
     })).rejects.toThrow('between 1 and 100');
   });
 
+  test('blocks targets younger than three days and active inbound referrers', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const young = await seedPurgePage('archive/too-young', 'young body', 2);
+    const old = await seedPurgePage('archive/active-ref-target', 'old body', 10);
+    await engine.putPage('projects/active-referrer', {
+      type: 'note', title: 'Active referrer', compiled_truth: 'active', timeline: '', frontmatter: {},
+    });
+    const referrer = (await engine.getPage('projects/active-referrer'))!;
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+       VALUES ($1::int, $2::int, 'related', 'active dependency', 'manual')`,
+      [referrer.id, old.id],
+    );
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-purge-gates-home-'));
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        await expect(op.handler(ctx(), {
+          action: 'plan', run_id: 'young-age-gate', allowlist: [entry(young)],
+        })).rejects.toThrow('younger than 3 days');
+        await expect(op.handler(ctx(), {
+          action: 'plan', run_id: 'active-inbound-gate', allowlist: [entry(old)],
+        })).rejects.toThrow('active dependency gate failed');
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test('atomically rechecks active dependencies at apply time', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const page = await seedPurgePage('archive/apply-ref-race', 'apply race', 10);
+    await engine.putPage('projects/apply-referrer', {
+      type: 'note', title: 'Apply referrer', compiled_truth: 'active', timeline: '', frontmatter: {},
+    });
+    const referrer = (await engine.getPage('projects/apply-referrer'))!;
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-purge-apply-ref-home-'));
+    const params = { action: 'plan', run_id: 'apply-active-ref', allowlist: [entry(page)] };
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        const plan = await op.handler(ctx(), params) as any;
+        await engine.executeRaw(
+          `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+           VALUES ($1::int, $2::int, 'related', 'late dependency', 'manual')`,
+          [referrer.id, page.id],
+        );
+        await expect(op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        })).rejects.toThrow('active dependency gate failed');
+        expect(await engine.getPage(page.slug, { includeDeleted: true })).not.toBeNull();
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test('verify fails closed when an expected SET NULL dependency drifts after apply', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const page = await seedPurgePage('archive/set-null-verify', 'set null verify', 10);
+    await engine.putPage('projects/set-null-drift', {
+      type: 'note', title: 'Set null drift', compiled_truth: 'active', timeline: '', frontmatter: {},
+    });
+    const drift = (await engine.getPage('projects/set-null-drift'))!;
+    await engine.executeRaw(
+      `INSERT INTO files (source_id, page_slug, page_id, filename, storage_path, content_hash, metadata)
+       VALUES ('default', $1, $2::int, 'verify.txt', 'purge-test/verify.txt', $3, '{}'::jsonb)`,
+      [page.slug, page.id, 'e'.repeat(64)],
+    );
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-purge-verify-graph-home-'));
+    const params = { action: 'plan', run_id: 'verify-full-graph', allowlist: [entry(page)] };
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        const plan = await op.handler(ctx(), params) as any;
+        await op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        });
+        await engine.executeRaw(
+          `UPDATE files SET page_id = $1::int WHERE storage_path = 'purge-test/verify.txt'`, [drift.id],
+        );
+        await expect(op.handler(ctx(), { ...params, action: 'verify' }))
+          .rejects.toThrow('purge verification failed');
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   test('plans, purges, verifies, and restores a bounded exact graph from a private backup', async () => {
     const op = operationsByName.purge_pages_exact;
     const first = await seedPurgePage('archive/purge-one', 'private purge body one', 10);
@@ -554,8 +728,13 @@ describe('purge_pages_exact', () => {
     await engine.putPage('projects/purge-referrer', {
       type: 'note', title: 'Referrer', compiled_truth: 'active', timeline: '', frontmatter: {},
     });
-    await engine.addLink('projects/purge-referrer', first.slug, 'delete with target', 'related', 'manual');
     const referrer = (await engine.getPage('projects/purge-referrer'))!;
+    await engine.softDeletePage(referrer.slug);
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+       VALUES ($1::int, $2::int, 'related', 'delete with target', 'manual')`,
+      [referrer.id, first.id],
+    );
     await engine.executeRaw(
       `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
        VALUES ($1::int, $1::int, 'origin-only', 'origin only', 'frontmatter', $2::int, 'related')`,

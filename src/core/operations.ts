@@ -32,6 +32,7 @@ import { stripFactsFence } from './facts-fence.ts';
 import { getContentFlag } from './quarantine.ts';
 import { bumpLastRetrievedAt } from './last-retrieved.ts';
 import { isSearchMode } from './search/mode.ts';
+import { normalizeAliasList } from './search/alias-normalize.ts';
 import { stampEvidence } from './search/evidence.ts';
 import type { SearchResult } from './types.ts';
 import { CJK_SLUG_CHARS } from './cjk.ts';
@@ -1200,12 +1201,18 @@ async function exactPageMatches(
   const page = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
   if (!page || page.deleted_at || page.source_id !== sourceId || page.content_hash !== expectedContentHash) return false;
   const tags = (await ctx.engine.getTags(slug, { sourceId })).sort();
+  const aliases = await ctx.engine.executeRaw<{ alias_norm: string }>(
+    `SELECT alias_norm FROM page_aliases WHERE source_id = $1 AND slug = $2 ORDER BY alias_norm`,
+    [sourceId, slug],
+  );
+  const expectedAliases = normalizeAliasList(expected.frontmatter.aliases).sort();
   return page.type === expected.type
     && page.title === expected.title
     && page.compiled_truth === expected.compiled_truth
     && page.timeline === expected.timeline
     && isDeepStrictEqual(stableImportFrontmatter(page.frontmatter), stableImportFrontmatter(expected.frontmatter))
-    && isDeepStrictEqual(tags, [...expected.tags].sort());
+    && isDeepStrictEqual(tags, [...expected.tags].sort())
+    && isDeepStrictEqual(aliases.map((row) => row.alias_norm), expectedAliases);
 }
 
 const create_page_file_exact: Operation = {
@@ -1256,6 +1263,7 @@ const create_page_file_exact: Operation = {
         sourceId,
         filename: slug.split('/').pop() ?? slug,
         remote: false,
+        createOnly: true,
       });
     } catch (error) {
       if (await exactPageMatches(ctx, slug, sourceId, expectedPage, expectedContentHash)) {
@@ -1528,7 +1536,13 @@ const soft_delete_page_exact: Operation = {
       throw new OperationError('storage_error', `soft_delete_page_exact drift: content hash changed for "${slug}"`);
     }
     if (before.deleted_at) {
-      return { status: 'already_soft_deleted', slug, content_hash: expectedContentHash, deleted_at: before.deleted_at };
+      if (p.accept_ambiguous_commit !== true) {
+        throw new OperationError('storage_error', 'already soft-deleted without durable operation evidence; retry with accept_ambiguous_commit=true after operator review');
+      }
+      return {
+        status: 'soft_deleted', slug, content_hash: expectedContentHash,
+        deleted_at: before.deleted_at, recovered_after_ambiguous_commit: true,
+      };
     }
     if (ctx.dryRun) {
       return { dry_run: true, action: 'soft_delete_page_exact', slug, require_zero_inbound: p.require_zero_inbound === true };
@@ -1536,10 +1550,27 @@ const soft_delete_page_exact: Operation = {
 
     try {
       await ctx.engine.transaction(async (tx) => {
+        const locked = await tx.executeRaw<{
+          id: number | string;
+          content_hash: string;
+          deleted_at: Date | string | null;
+        }>(`
+          SELECT id, content_hash, deleted_at
+            FROM pages
+           WHERE source_id = $1 AND slug = $2
+           FOR UPDATE
+        `, [sourceId, slug]);
+        if (locked.length !== 1 || Number(locked[0].id) !== before.id
+          || locked[0].content_hash !== expectedContentHash) {
+          throw new Error(`soft-delete identity changed for ${slug}`);
+        }
+        if (locked[0].deleted_at) {
+          throw new Error(`soft-delete state became ambiguous for ${slug}`);
+        }
         if (p.require_zero_inbound === true) {
           const [row] = await tx.executeRaw<{ inbound_count: number | string }>(
             `SELECT count(*)::bigint AS inbound_count FROM links WHERE to_page_id = $1::int`,
-            [before.id],
+            [Number(locked[0].id)],
           );
           if (Number(row?.inbound_count || 0) !== 0) {
             throw new Error(`soft_delete_page_exact zero-inbound gate failed for "${slug}"`);
@@ -1550,7 +1581,7 @@ const soft_delete_page_exact: Operation = {
            WHERE id = $1::int AND source_id = $2 AND slug = $3
              AND content_hash = $4 AND deleted_at IS NULL
            RETURNING deleted_at
-        `, [before.id, sourceId, slug, expectedContentHash]);
+        `, [Number(locked[0].id), sourceId, slug, expectedContentHash]);
         if (changed.length !== 1) throw new Error(`soft-delete identity changed for ${slug}`);
       });
     } catch (error) {
