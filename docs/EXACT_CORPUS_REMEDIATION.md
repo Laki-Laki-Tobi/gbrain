@@ -8,11 +8,13 @@ through the local `gbrain call` surface with an explicit source selection.
 
 - `create_page_file_exact` creates only an absent lowercase slug. The input
   must be an absolute regular UTF-8 file with mode `0600`, and
-  `expected_content_sha256` must match its bytes. Canonical ingestion runs
-  without embedding. The page row uses a plain insert, so the database unique
-  constraint atomically rejects a concurrent creator instead of entering an
-  upsert path. The resulting page, tags, aliases, and content hash are read
-  back exactly.
+  `expected_content_sha256` must match its bytes. The required lowercase
+  `expected_postimage_content_hash` must match the canonical parsed page before
+  any write. Canonical ingestion runs without embedding or automatic
+  doc-to-code relations. The page row uses a plain insert, so the database
+  unique constraint atomically rejects a concurrent creator instead of
+  entering an upsert path. The resulting page, tags, aliases, and approved
+  content hash are read back exactly.
 - `put_page_file_exact` merges an approved private-file draft into one active
   lowercase source/slug. `expected_content_hash` binds the active preimage,
   `expected_content_sha256` binds the file bytes, and
@@ -22,8 +24,9 @@ through the local `gbrain call` surface with an explicit source selection.
   and transactional. This operation calls the canonical importer directly with
   embedding disabled; it does not run ordinary `put_page` repository
   write-through, auto-link, timeline, facts, chronicle, or post-write lint
-  hooks. Readback strictly verifies page fields, type, tags, aliases, source,
-  and canonical content hash.
+  hooks, and importer doc-to-code relation extraction is disabled. Readback
+  strictly verifies page fields, type, tags, aliases, source, and canonical
+  content hash.
 - `soft_delete_page_exact` binds the mutation to source, slug, and
   `expected_content_hash`. Set `require_zero_inbound=true` to block while any
   database backlink exists. Endpoint row locks serialize this gate with both

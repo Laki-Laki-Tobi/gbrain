@@ -945,36 +945,40 @@ export async function importFromContent(
     // page. addLink throws when either endpoint is missing (master tightened
     // this in v0.18.x), so we wrap each pair in try/catch — guides imported
     // before their code repo syncs are common, and the missing edges land
-    // later via `gbrain reconcile-links` (Layer 8 D3, v0.21.0).
-    const codeRefs = extractCodeRefs(parsed.compiled_truth + '\n' + (parsed.timeline || ''));
-    // For doc↔impl edges, both endpoints are within the same source as the
-    // markdown page being imported. Cross-source edges (markdown in one
-    // source, code in another) currently fail with "page not found" — a
-    // faster failure mode than the pre-fix cross-product fan-out, which
-    // silently wired edges to whichever same-slug page Postgres returned
-    // first across sources.
-    const linkOpts = sourceId
-      ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId }
-      : undefined;
-    for (const ref of codeRefs) {
-      const codeSlug = slugifyCodePath(ref.path);
-      // Forward: markdown guide → code page (this guide documents that code)
-      try {
-        await tx.addLink(
-          slug, codeSlug,
-          ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path,
-          'documents', 'markdown', slug, 'compiled_truth',
-          linkOpts,
-        );
-      } catch { /* code page not yet imported — reconcile-links will catch it */ }
-      // Reverse: code page → markdown guide (this code is documented by the guide)
-      try {
-        await tx.addLink(
-          codeSlug, slug,
-          ref.path, 'documented_by', 'markdown', slug, 'compiled_truth',
-          linkOpts,
-        );
-      } catch { /* same reason — silent skip */ }
+    // later via `gbrain reconcile-links` (Layer 8 D3, v0.21.0). Exact create
+    // and remediation merge intentionally skip this automatic relation layer;
+    // their reviewed postimage is limited to page, tags, aliases, and chunks.
+    if (!opts.createOnly && !opts.exactMerge) {
+      const codeRefs = extractCodeRefs(parsed.compiled_truth + '\n' + (parsed.timeline || ''));
+      // For doc↔impl edges, both endpoints are within the same source as the
+      // markdown page being imported. Cross-source edges (markdown in one
+      // source, code in another) currently fail with "page not found" — a
+      // faster failure mode than the pre-fix cross-product fan-out, which
+      // silently wired edges to whichever same-slug page Postgres returned
+      // first across sources.
+      const linkOpts = sourceId
+        ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId }
+        : undefined;
+      for (const ref of codeRefs) {
+        const codeSlug = slugifyCodePath(ref.path);
+        // Forward: markdown guide → code page (this guide documents that code)
+        try {
+          await tx.addLink(
+            slug, codeSlug,
+            ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path,
+            'documents', 'markdown', slug, 'compiled_truth',
+            linkOpts,
+          );
+        } catch { /* code page not yet imported — reconcile-links will catch it */ }
+        // Reverse: code page → markdown guide (this code is documented by the guide)
+        try {
+          await tx.addLink(
+            codeSlug, slug,
+            ref.path, 'documented_by', 'markdown', slug, 'compiled_truth',
+            linkOpts,
+          );
+        } catch { /* same reason — silent skip */ }
+      }
     }
   });
 

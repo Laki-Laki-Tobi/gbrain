@@ -2,6 +2,18 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.9] - 2026-08-28
+
+### Fixed
+- `create_page_file_exact` now requires a lowercase canonical
+  `expected_postimage_content_hash`, rejects a mismatched parsed draft before
+  any write, and returns that approved hash after strict readback.
+- Exact create and exact merge now skip importer doc-to-code relation
+  extraction, preventing approved corpus remediation from creating automatic
+  links outside the exact page, tag, alias, version, and chunk projection.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.8] - 2026-08-28
 
 ### Fixed

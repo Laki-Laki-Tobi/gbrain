@@ -1217,10 +1217,11 @@ async function exactPageMatches(
 
 const create_page_file_exact: Operation = {
   name: 'create_page_file_exact',
-  description: 'Local-admin source-scoped creation of an absent lowercase page from a private sha256-gated file.',
+  description: 'Local-admin source-scoped creation of an absent lowercase page from a private file with exact byte and canonical postimage hashes.',
   params: {
     slug: { type: 'string', required: true },
-    expected_content_sha256: { type: 'string', required: true },
+    expected_content_sha256: { type: 'string', required: true, description: 'Exact SHA-256 of the private file bytes.' },
+    expected_postimage_content_hash: { type: 'string', required: true, description: 'Exact canonical content hash approved for the created page.' },
     file_path: { type: 'string', required: true },
     accept_ambiguous_commit: { type: 'boolean' },
   },
@@ -1233,8 +1234,12 @@ const create_page_file_exact: Operation = {
     }
     const slug = requireLowercaseExactSlug(p.slug);
     const expectedFileSha256 = requireExactString(p, 'expected_content_sha256');
+    const expectedPostimageContentHash = requireExactString(p, 'expected_postimage_content_hash');
     if (!/^[a-f0-9]{64}$/.test(expectedFileSha256)) {
       throw new OperationError('invalid_params', 'expected_content_sha256 must be lowercase sha256 hex');
+    }
+    if (!/^[a-f0-9]{64}$/.test(expectedPostimageContentHash)) {
+      throw new OperationError('invalid_params', 'expected_postimage_content_hash must be lowercase sha256 hex');
     }
     const filePath = requireExactString(p, 'file_path');
     const { content, sha256: fileSha256 } = await readPrivateExactFile(filePath);
@@ -1243,17 +1248,26 @@ const create_page_file_exact: Operation = {
     }
     const sourceId = ctx.sourceId || 'default';
     const expectedPage = parsedPageFromContent(content, slug);
-    const expectedContentHash = computeImportContentHash(expectedPage);
+    const computedPostimageContentHash = computeImportContentHash(expectedPage);
+    if (computedPostimageContentHash !== expectedPostimageContentHash) {
+      throw new OperationError('storage_error', `create_page_file_exact postimage hash mismatch for "${slug}"`);
+    }
     const current = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
     if (current) {
       if (p.accept_ambiguous_commit === true
-        && await exactPageMatches(ctx, slug, sourceId, expectedPage, expectedContentHash)) {
-        return { status: 'created', slug, content_hash: expectedContentHash, recovered_after_ambiguous_commit: true };
+        && await exactPageMatches(ctx, slug, sourceId, expectedPage, expectedPostimageContentHash)) {
+        return { status: 'created', slug, content_hash: expectedPostimageContentHash, recovered_after_ambiguous_commit: true };
       }
       throw new OperationError('storage_error', `create_page_file_exact absence gate failed for "${slug}"`);
     }
     if (ctx.dryRun) {
-      return { dry_run: true, action: 'create_page_file_exact', slug, content_sha256: fileSha256 };
+      return {
+        dry_run: true,
+        action: 'create_page_file_exact',
+        slug,
+        content_sha256: fileSha256,
+        postimage_content_hash: expectedPostimageContentHash,
+      };
     }
 
     let result;
@@ -1266,19 +1280,19 @@ const create_page_file_exact: Operation = {
         createOnly: true,
       });
     } catch (error) {
-      if (await exactPageMatches(ctx, slug, sourceId, expectedPage, expectedContentHash)) {
+      if (await exactPageMatches(ctx, slug, sourceId, expectedPage, expectedPostimageContentHash)) {
         if (p.accept_ambiguous_commit !== true) {
           throw new OperationError('storage_error', 'ambiguous create commit requires accept_ambiguous_commit=true after operator review');
         }
-        return { status: 'created', slug, content_hash: expectedContentHash, recovered_after_ambiguous_commit: true };
+        return { status: 'created', slug, content_hash: expectedPostimageContentHash, recovered_after_ambiguous_commit: true };
       }
       throw error;
     }
     if (result.status !== 'imported' || !result.parsedPage
-      || !(await exactPageMatches(ctx, slug, sourceId, result.parsedPage, expectedContentHash))) {
+      || !(await exactPageMatches(ctx, slug, sourceId, expectedPage, expectedPostimageContentHash))) {
       throw new OperationError('storage_error', `create_page_file_exact readback mismatch for ${slug}`);
     }
-    return { status: 'created', slug, content_hash: expectedContentHash, recovered_after_ambiguous_commit: false };
+    return { status: 'created', slug, content_hash: expectedPostimageContentHash, recovered_after_ambiguous_commit: false };
   },
 };
 

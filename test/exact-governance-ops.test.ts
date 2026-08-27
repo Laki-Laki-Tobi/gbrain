@@ -298,6 +298,9 @@ describe('put_page_file_exact', () => {
     await engine.putPage('projects/file-target', {
       type: 'note', title: 'Target', compiled_truth: 'target', timeline: '', frontmatter: {},
     });
+    await engine.putPage('src-core-sync-ts', {
+      type: 'code', title: 'src/core/sync.ts', compiled_truth: 'code target', timeline: '', frontmatter: {},
+    });
     await engine.putPage('projects/exact-file', {
       type: 'note', title: 'Before', compiled_truth: 'old body', timeline: '', frontmatter: {},
     });
@@ -307,7 +310,7 @@ describe('put_page_file_exact', () => {
     const dir = await mkdtemp(join(tmpdir(), 'gbrain-exact-file-'));
     const filePath = join(dir, 'page.md');
     const marker = 'private-file-content-marker';
-    const content = `---\ntype: note\ntitle: After\ntags:\n  - exact-file\naliases:\n  - Exact File Alias\nrelated:\n  - projects/file-target\n---\n\n# After\n\n${marker}\n`;
+    const content = `---\ntype: note\ntitle: After\ntags:\n  - exact-file\naliases:\n  - Exact File Alias\nrelated:\n  - projects/file-target\n---\n\n# After\n\n${marker}. See src/core/sync.ts:42.\n`;
     const fileSha = createHash('sha256').update(content).digest('hex');
     const postimageHash = canonicalPostimageHash(before.slug, content);
     const exactParams = {
@@ -371,6 +374,7 @@ describe('put_page_file_exact', () => {
       expect(afterCounts.chunks).toBeGreaterThan(0);
       expect(tags).toEqual(['exact-file']);
       expect(links.some((link) => link.to_slug === 'projects/file-target')).toBe(false);
+      expect(await engine.executeRaw(`SELECT id FROM links`)).toEqual([]);
       expect(chunkEmbeddings.length).toBeGreaterThan(0);
       expect(chunkEmbeddings.every((row) => row.embedding_present === false)).toBe(true);
       expect(ordinaryPutCalls).toBe(0);
@@ -522,7 +526,10 @@ describe('exact corpus page operations', () => {
     });
     const remote = { ...ctx(), engine: explodingEngine, remote: true };
     const cases: Array<[string, Record<string, unknown>]> = [
-      ['create_page_file_exact', { slug: 'projects/new', expected_content_sha256: 'a'.repeat(64), file_path: '/tmp/nope' }],
+      ['create_page_file_exact', {
+        slug: 'projects/new', expected_content_sha256: 'a'.repeat(64),
+        expected_postimage_content_hash: 'b'.repeat(64), file_path: '/tmp/nope',
+      }],
       ['put_page_file_exact', {
         slug: 'projects/existing', expected_content_hash: 'a'.repeat(64),
         expected_content_sha256: 'b'.repeat(64), expected_postimage_content_hash: 'c'.repeat(64),
@@ -541,26 +548,67 @@ describe('exact corpus page operations', () => {
     }
   });
 
+  test('create requires an approved lowercase postimage hash before any write', async () => {
+    const op = operationsByName.create_page_file_exact;
+    expect(op.params.expected_postimage_content_hash).toMatchObject({ required: true });
+    const dir = await mkdtemp(join(tmpdir(), 'gbrain-create-postimage-gate-'));
+    const filePath = join(dir, 'summary.md');
+    const content = '---\ntype: note\ntitle: Rejected summary\ntags:\n  - rejected\naliases:\n  - Rejected Alias\n---\n\nRejected body.\n';
+    const baselineCounts = await counts();
+    try {
+      await writeFile(filePath, content, { mode: 0o600 });
+      const params = {
+        slug: 'projects/rejected-summary',
+        expected_content_sha256: createHash('sha256').update(content).digest('hex'),
+        expected_postimage_content_hash: canonicalPostimageHash('projects/rejected-summary', content),
+        file_path: filePath,
+      };
+      await expect(op.handler(ctx(), {
+        ...params, expected_postimage_content_hash: 'A'.repeat(64),
+      })).rejects.toThrow('must be lowercase sha256 hex');
+      await expect(op.handler(ctx(), {
+        ...params, expected_postimage_content_hash: '0'.repeat(64),
+      })).rejects.toThrow('postimage hash mismatch');
+
+      expect(await engine.getPage(params.slug, { includeDeleted: true })).toBeNull();
+      expect(await counts()).toEqual(baselineCounts);
+      expect(await engine.executeRaw(
+        `SELECT alias_norm FROM page_aliases WHERE source_id = 'default' AND slug = $1`, [params.slug],
+      )).toEqual([]);
+      expect(await engine.executeRaw(`SELECT id FROM links`)).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test('creates an absent lowercase page from an exact private file and recovers only with an explicit ambiguity gate', async () => {
     const op = operationsByName.create_page_file_exact;
     const dir = await mkdtemp(join(tmpdir(), 'gbrain-create-exact-'));
     const filePath = join(dir, 'summary.md');
-    const content = '---\ntype: note\ntitle: Exact summary\ntags:\n  - governance\naliases:\n  - Exact Alias\n---\n\n# Exact summary\n\nBounded semantic content.\n';
+    const content = '---\ntype: note\ntitle: Exact summary\ntags:\n  - governance\naliases:\n  - Exact Alias\n---\n\n# Exact summary\n\nBounded semantic content. See src/core/sync.ts:42.\n';
     const fileSha = createHash('sha256').update(content).digest('hex');
+    const exactParams = {
+      slug: 'projects/new-summary',
+      expected_content_sha256: fileSha,
+      expected_postimage_content_hash: canonicalPostimageHash('projects/new-summary', content),
+      file_path: filePath,
+    };
     try {
+      await engine.putPage('src-core-sync-ts', {
+        type: 'code', title: 'src/core/sync.ts', compiled_truth: 'code target', timeline: '', frontmatter: {},
+      });
       await writeFile(filePath, content, { mode: 0o600 });
       await expect(op.handler(ctx(), {
-        slug: 'Projects/New-Summary', expected_content_sha256: fileSha, file_path: filePath,
+        ...exactParams, slug: 'Projects/New-Summary',
       })).rejects.toThrow('lowercase');
       await expect(op.handler(ctx(), {
-        slug: 'projects/new-summary', expected_content_sha256: '0'.repeat(64), file_path: filePath,
+        ...exactParams, expected_content_sha256: '0'.repeat(64),
       })).rejects.toThrow('file sha256 changed');
 
-      const created = await op.handler(ctx(), {
-        slug: 'projects/new-summary', expected_content_sha256: fileSha, file_path: filePath,
-      }) as any;
+      const created = await op.handler(ctx(), exactParams) as any;
       expect(created.status).toBe('created');
       expect(created.recovered_after_ambiguous_commit).toBe(false);
+      expect(created.content_hash).toBe(exactParams.expected_postimage_content_hash);
       const page = await engine.getPage('projects/new-summary', { sourceId: 'default' });
       expect(page?.title).toBe('Exact summary');
       expect(page?.compiled_truth).toContain('Bounded semantic content.');
@@ -569,13 +617,11 @@ describe('exact corpus page operations', () => {
         `SELECT alias_norm FROM page_aliases WHERE source_id = 'default' AND slug = $1`,
         ['projects/new-summary'],
       )).toEqual([{ alias_norm: 'exact alias' }]);
+      expect(await engine.executeRaw(`SELECT id FROM links`)).toEqual([]);
 
-      await expect(op.handler(ctx(), {
-        slug: 'projects/new-summary', expected_content_sha256: fileSha, file_path: filePath,
-      })).rejects.toThrow('absence gate failed');
+      await expect(op.handler(ctx(), exactParams)).rejects.toThrow('absence gate failed');
       const recovered = await op.handler(ctx(), {
-        slug: 'projects/new-summary', expected_content_sha256: fileSha, file_path: filePath,
-        accept_ambiguous_commit: true,
+        ...exactParams, accept_ambiguous_commit: true,
       }) as any;
       expect(recovered.recovered_after_ambiguous_commit).toBe(true);
 
@@ -584,8 +630,7 @@ describe('exact corpus page operations', () => {
         ['projects/new-summary'],
       );
       await expect(op.handler(ctx(), {
-        slug: 'projects/new-summary', expected_content_sha256: fileSha, file_path: filePath,
-        accept_ambiguous_commit: true,
+        ...exactParams, accept_ambiguous_commit: true,
       })).rejects.toThrow('absence gate failed');
 
       await engine.executeRaw(
@@ -593,9 +638,7 @@ describe('exact corpus page operations', () => {
         ['other-source'],
       );
       const otherCtx = { ...ctx(), sourceId: 'other-source' };
-      const other = await op.handler(otherCtx, {
-        slug: 'projects/new-summary', expected_content_sha256: fileSha, file_path: filePath,
-      }) as any;
+      const other = await op.handler(otherCtx, exactParams) as any;
       expect(other.status).toBe('created');
       expect((await engine.getPage('projects/new-summary', { sourceId: 'other-source' }))?.source_id).toBe('other-source');
     } finally {
@@ -671,6 +714,7 @@ describe('exact corpus page operations', () => {
       const outcomes = await Promise.allSettled(paths.map((file, index) => op.handler(ctx(), {
         slug: 'projects/concurrent-create',
         expected_content_sha256: createHash('sha256').update(contents[index]).digest('hex'),
+        expected_postimage_content_hash: canonicalPostimageHash('projects/concurrent-create', contents[index]),
         file_path: file,
       })));
       expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
@@ -696,6 +740,7 @@ describe('exact corpus page operations', () => {
       await expect(op.handler(ctx(), {
         slug: 'projects/alias-failure',
         expected_content_sha256: createHash('sha256').update(content).digest('hex'),
+        expected_postimage_content_hash: canonicalPostimageHash('projects/alias-failure', content),
         file_path: file,
       })).rejects.toThrow('injected alias projection failure');
       expect(await engine.getPage('projects/alias-failure', { includeDeleted: true })).toBeNull();
