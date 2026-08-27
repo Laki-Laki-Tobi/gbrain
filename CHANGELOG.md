@@ -2,6 +2,15 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.2] - 2026-08-27
+
+### Added
+- `list_pages` now accepts a bounded `offset` and can optionally return
+  `content_hash`, enabling stable source-scoped exact inventories without
+  direct database access or thousands of single-page calls.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.1] - 2026-08-27
 
 ### Fixed

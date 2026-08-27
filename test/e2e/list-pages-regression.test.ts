@@ -10,6 +10,7 @@
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { operations } from '../../src/core/operations.ts';
 
 let engine: PGLiteEngine;
 
@@ -90,5 +91,47 @@ describe('v0.29 — list_pages sort enum threads through the engine', () => {
     const rows = await engine.listPages({ limit: 10, sort: 'whatever' as any });
     // Engine PAGE_SORT_SQL[unknown] is undefined → falls back to default desc.
     expect(rows.length).toBeGreaterThan(0);
+  });
+});
+
+describe('v0.42.59.2 — exact inventory pagination', () => {
+  test('operation threads offset and emits content_hash only when requested', async () => {
+    const op = operations.find((item) => item.name === 'list_pages')!;
+    const ctx = { engine, sourceId: 'default', remote: false } as never;
+    const first = await op.handler(ctx, { limit: 2, offset: 0, sort: 'slug' }) as Array<Record<string, unknown>>;
+    const second = await op.handler(ctx, {
+      limit: 2,
+      offset: 2,
+      sort: 'slug',
+      include_content_hash: true,
+    }) as Array<Record<string, unknown>>;
+
+    expect(first).toHaveLength(2);
+    expect(second).toHaveLength(2);
+    expect(first.map((row) => row.slug)).not.toEqual(second.map((row) => row.slug));
+    expect(first.every((row) => !Object.hasOwn(row, 'content_hash'))).toBe(true);
+    expect(second.every((row) => typeof row.content_hash === 'string' && row.content_hash.length === 64)).toBe(true);
+  });
+
+  test('operation normalizes unsafe offsets before calling the engine', async () => {
+    const op = operations.find((item) => item.name === 'list_pages')!;
+    let observedOffset = -1;
+    const ctx = {
+      sourceId: 'default',
+      remote: false,
+      engine: {
+        listPages: async (filters: { offset?: number }) => {
+          observedOffset = filters.offset ?? -1;
+          return [];
+        },
+      },
+    } as never;
+
+    await op.handler(ctx, { offset: -50 });
+    expect(observedOffset).toBe(0);
+    await op.handler(ctx, { offset: Number.POSITIVE_INFINITY });
+    expect(observedOffset).toBe(0);
+    await op.handler(ctx, { offset: 5_000_000.9 });
+    expect(observedOffset).toBe(1_000_000);
   });
 });
