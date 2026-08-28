@@ -154,6 +154,7 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
       'put_page_file_exact',
       'soft_delete_page_exact',
       'restore_page_exact',
+      'remove_link_exact',
       'purge_pages_exact',
       'purge_deleted_pages',
       'get_recent_transcripts',
@@ -219,6 +220,18 @@ describe('handler invocation — historically-broken trust-boundary classes', ()
   // RCE; D18 P0 image_path remote-leak). file_upload and sync_brain are
   // omitted because they're localOnly (codex CMT-3 — testing their
   // handlers with remote=true tests an impossible production path).
+
+  test('remove_link_exact rejects ctx.remote=true as defense in depth', async () => {
+    const removeLinkExact = operations.find(op => op.name === 'remove_link_exact');
+    expect(removeLinkExact).toBeDefined();
+    await expect(removeLinkExact!.handler(makeContext({ remote: true }), {
+      from: 'from', to: 'to', link_type: '', context: '',
+      link_source_is_null: true,
+      origin_slug_is_null: true,
+      origin_field_is_null: true,
+      resolution_type_is_null: true,
+    })).rejects.toThrow('local-only');
+  });
 
   test('submit_job rejects shell with ctx.remote=true (HTTP MCP shell-job RCE class)', async () => {
     const submitJob = operations.find(op => op.name === 'submit_job');

@@ -365,6 +365,88 @@ describe('remove_link op — type/source filters', () => {
     expect(await engine.getLinks('restore-managed-from', { includeDeleted: true })).toEqual([snapshot]);
   });
 
+  test('remove_link_exact removes only the full nullable identity and preserves sibling edges', async () => {
+    await engine.putPage('remove-exact-from', { type: 'note', title: 'From', compiled_truth: 'from', timeline: '', frontmatter: {} });
+    await engine.putPage('remove-exact-to', { type: 'note', title: 'To', compiled_truth: 'to', timeline: '', frontmatter: {} });
+    await engine.addLink('remove-exact-from', 'remove-exact-to', '', 'related', undefined);
+    await engine.addLink('remove-exact-from', 'remove-exact-to', '', 'related', 'citation-graph');
+
+    await expect(operationsByName.remove_link_exact.handler(makeCtx(), {
+      from: 'remove-exact-from', to: 'remove-exact-to', link_type: 'related', context: 'mutated',
+      link_source: 'markdown', origin_slug_is_null: true,
+      origin_field_is_null: true, resolution_type_is_null: true,
+    })).rejects.toThrow('exact edge was not unique');
+    expect(await engine.getLinks('remove-exact-from', { includeDeleted: true })).toHaveLength(2);
+
+    const result = await operationsByName.remove_link_exact.handler(makeCtx(), {
+      from: 'remove-exact-from',
+      to: 'remove-exact-to',
+      link_type: 'related',
+      context: '',
+      link_source: 'markdown',
+      origin_slug_is_null: true,
+      origin_field_is_null: true,
+      resolution_type_is_null: true,
+    });
+    expect(result).toMatchObject({ status: 'removed' });
+
+    const remaining = await engine.getLinks('remove-exact-from', { includeDeleted: true });
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]).toMatchObject({ link_source: 'citation-graph' });
+    await expect(operationsByName.remove_link_exact.handler(makeCtx(), {
+      from: 'remove-exact-from', to: 'remove-exact-to', link_type: 'related', context: '',
+      link_source: 'markdown', origin_slug_is_null: true,
+      origin_field_is_null: true, resolution_type_is_null: true,
+    })).rejects.toThrow('exact edge was not unique');
+    expect(await engine.getLinks('remove-exact-from', { includeDeleted: true })).toEqual(remaining);
+  });
+
+  test('simultaneous exact removals yield one success and one zero-row failure', async () => {
+    await engine.putPage('remove-exact-race-from', { type: 'note', title: 'From', compiled_truth: 'from', timeline: '', frontmatter: {} });
+    await engine.putPage('remove-exact-race-to', { type: 'note', title: 'To', compiled_truth: 'to', timeline: '', frontmatter: {} });
+    await engine.addLink('remove-exact-race-from', 'remove-exact-race-to', '', 'related', 'citation-graph');
+    const params = {
+      from: 'remove-exact-race-from', to: 'remove-exact-race-to', link_type: 'related', context: '',
+      link_source: 'citation-graph', origin_slug_is_null: true,
+      origin_field_is_null: true, resolution_type_is_null: true,
+    };
+
+    const results = await Promise.allSettled([
+      operationsByName.remove_link_exact.handler(makeCtx(), params),
+      operationsByName.remove_link_exact.handler(makeCtx(), params),
+    ]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    expect(await engine.getLinks('remove-exact-race-from', { includeDeleted: true })).toEqual([]);
+  });
+
+  test('remove_link_exact source-scopes endpoint and origin identity', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path) VALUES ($1, $1, $2) ON CONFLICT (id) DO NOTHING`,
+      ['other', '/tmp/remove-link-exact-other'],
+    );
+    for (const sourceId of ['default', 'other']) {
+      const opts = sourceId === 'default' ? undefined : { sourceId };
+      await engine.putPage('remove-exact-scoped-from', { type: 'note', title: 'From', compiled_truth: sourceId, timeline: '', frontmatter: {} }, opts);
+      await engine.putPage('remove-exact-scoped-to', { type: 'note', title: 'To', compiled_truth: sourceId, timeline: '', frontmatter: {} }, opts);
+      await engine.putPage('remove-exact-scoped-origin', { type: 'note', title: 'Origin', compiled_truth: sourceId, timeline: '', frontmatter: {} }, opts);
+      await engine.addLink(
+        'remove-exact-scoped-from', 'remove-exact-scoped-to', 'scoped', 'related',
+        'frontmatter', 'remove-exact-scoped-origin', 'related',
+        { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId, resolutionType: 'qualified' },
+      );
+    }
+
+    await operationsByName.remove_link_exact.handler(makeCtx({ sourceId: 'default' }), {
+      from: 'remove-exact-scoped-from', to: 'remove-exact-scoped-to',
+      link_type: 'related', context: 'scoped', link_source: 'frontmatter',
+      origin_slug: 'remove-exact-scoped-origin', origin_field: 'related', resolution_type: 'qualified',
+    });
+
+    expect(await engine.getLinks('remove-exact-scoped-from', { sourceId: 'default', includeDeleted: true })).toEqual([]);
+    expect(await engine.getLinks('remove-exact-scoped-from', { sourceId: 'other', includeDeleted: true })).toHaveLength(1);
+  });
+
   test('restore_link_exact rejects incomplete identity and missing origin before insert', async () => {
     await engine.putPage('restore-fail-from', { type: 'note', title: 'From', compiled_truth: 'from', timeline: '', frontmatter: {} });
     await engine.putPage('restore-fail-to', { type: 'note', title: 'To', compiled_truth: 'to', timeline: '', frontmatter: {} });

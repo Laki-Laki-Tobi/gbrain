@@ -2767,6 +2767,54 @@ export class PostgresEngine implements BrainEngine {
     });
   }
 
+  async removeLinkExact(edge: ExactLinkIdentity, opts?: { sourceId?: string }): Promise<void> {
+    const sourceId = opts?.sourceId ?? 'default';
+    const endpoints = [edge.from_slug, edge.to_slug, edge.origin_slug]
+      .filter((value): value is string => value !== null)
+      .map((slug) => ({ source_id: sourceId, slug }));
+    await this.withLinkWriteTransaction(async (tx) => {
+      await tx.lockLinkEndpointsIncludingDeleted(endpoints);
+      const deleted = await tx.sql`
+        DELETE FROM links
+        WHERE from_page_id = (
+          SELECT id FROM pages WHERE slug = ${edge.from_slug} AND source_id = ${sourceId}
+        )
+          AND to_page_id = (
+            SELECT id FROM pages WHERE slug = ${edge.to_slug} AND source_id = ${sourceId}
+          )
+          AND link_type = ${edge.link_type}
+          AND context = ${edge.context}
+          AND link_source IS NOT DISTINCT FROM ${edge.link_source}
+          AND origin_page_id IS NOT DISTINCT FROM (
+            SELECT id FROM pages WHERE slug = ${edge.origin_slug} AND source_id = ${sourceId}
+          )
+          AND origin_field IS NOT DISTINCT FROM ${edge.origin_field}
+          AND resolution_type IS NOT DISTINCT FROM ${edge.resolution_type}
+        RETURNING id
+      `;
+      if (deleted.length !== 1) throw new Error('removeLinkExact failed: exact edge was not unique');
+      const [remaining] = await tx.sql<{ count: number }[]>`
+        SELECT count(*)::int AS count
+        FROM links
+        WHERE from_page_id = (
+          SELECT id FROM pages WHERE slug = ${edge.from_slug} AND source_id = ${sourceId}
+        )
+          AND to_page_id = (
+            SELECT id FROM pages WHERE slug = ${edge.to_slug} AND source_id = ${sourceId}
+          )
+          AND link_type = ${edge.link_type}
+          AND context = ${edge.context}
+          AND link_source IS NOT DISTINCT FROM ${edge.link_source}
+          AND origin_page_id IS NOT DISTINCT FROM (
+            SELECT id FROM pages WHERE slug = ${edge.origin_slug} AND source_id = ${sourceId}
+          )
+          AND origin_field IS NOT DISTINCT FROM ${edge.origin_field}
+          AND resolution_type IS NOT DISTINCT FROM ${edge.resolution_type}
+      `;
+      if (Number(remaining?.count) !== 0) throw new Error('removeLinkExact failed: exact edge remains after delete');
+    });
+  }
+
   async removeLink(
     from: string,
     to: string,

@@ -2616,6 +2616,38 @@ const restore_link_exact: Operation = {
   },
 };
 
+const remove_link_exact: Operation = {
+  name: 'remove_link_exact',
+  description: 'Local-admin rollback primitive that removes one exact link identity, including managed or NULL provenance.',
+  params: {
+    from: { type: 'string', required: true },
+    to: { type: 'string', required: true },
+    link_type: { type: 'string', required: true },
+    context: { type: 'string', required: true },
+    link_source: { type: 'string' },
+    link_source_is_null: { type: 'boolean' },
+    origin_slug: { type: 'string' },
+    origin_slug_is_null: { type: 'boolean' },
+    origin_field: { type: 'string' },
+    origin_field_is_null: { type: 'boolean' },
+    resolution_type: { type: 'string' },
+    resolution_type_is_null: { type: 'boolean' },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError('permission_denied', 'remove_link_exact is local-only and must be called through the local CLI.');
+    }
+    const edge = parseExactLinkIdentity(p);
+    const sourceId = ctx.sourceId || 'default';
+    if (ctx.dryRun) return { dry_run: true, action: 'remove_link_exact', edge };
+    await ctx.engine.removeLinkExact(edge, { sourceId });
+    return { status: 'removed', edge };
+  },
+};
+
 const EXACT_METADATA_KEYS = new Set([
   'status',
   'memory_tier',
@@ -6127,7 +6159,7 @@ export const operations: Operation[] = [
   // Tags
   add_tag, remove_tag, get_tags,
   // Links
-  add_link, remove_link, restore_link_exact, get_links, get_backlinks, list_link_sources, traverse_graph,
+  add_link, remove_link, restore_link_exact, remove_link_exact, get_links, get_backlinks, list_link_sources, traverse_graph,
   // Timeline
   add_timeline_entry, get_timeline,
   // Admin
