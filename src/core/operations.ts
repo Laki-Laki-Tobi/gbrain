@@ -39,7 +39,7 @@ import { CJK_SLUG_CHARS } from './cjk.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
 import { runPageVersionRetention } from './page-version-retention.ts';
-import { runPurgePagesExact, type PurgeAllowlistEntry } from './exact-corpus-remediation.ts';
+import { inventoryDeletedPagesExact, runPurgePagesExact, type PurgeAllowlistEntry } from './exact-corpus-remediation.ts';
 import {
   GET_RECENT_SALIENCE_DESCRIPTION,
   FIND_ANOMALIES_DESCRIPTION,
@@ -2844,6 +2844,56 @@ const purge_pages_exact: Operation = {
       throw new OperationError('storage_error', error instanceof Error ? error.message : String(error));
     }
   },
+};
+
+const inventory_deleted_pages_exact: Operation = {
+  name: 'inventory_deleted_pages_exact',
+  description: 'Local-admin read-only inventory of source-scoped soft-deleted page purge candidates.',
+  params: {
+    slugs: { type: 'array', items: { type: 'string' } },
+    limit: { type: 'number', description: 'Maximum rows (1-500; default 100).' },
+    after_slug: { type: 'string', description: 'Exclusive lowercase cursor for source-wide enumeration.' },
+    min_age_hours: { type: 'number', description: 'Minimum deletion age in whole hours (72-8760; default 72).' },
+  },
+  mutating: false,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError('permission_denied', 'inventory_deleted_pages_exact is local-only and must be called through the local CLI.');
+    }
+    const limit = p.limit ?? 100;
+    if (!Number.isInteger(limit) || Number(limit) < 1 || Number(limit) > 500) {
+      throw new OperationError('invalid_params', 'limit must be an integer between 1 and 500');
+    }
+    const minAgeHours = p.min_age_hours ?? 72;
+    if (!Number.isInteger(minAgeHours) || Number(minAgeHours) < 72 || Number(minAgeHours) > 8760) {
+      throw new OperationError('invalid_params', 'min_age_hours must be an integer between 72 and 8760');
+    }
+    let slugs: string[] | undefined;
+    if (p.slugs !== undefined) {
+      if (!Array.isArray(p.slugs) || p.slugs.length === 0 || p.slugs.length > 500) {
+        throw new OperationError('invalid_params', 'slugs must contain between 1 and 500 lowercase entries');
+      }
+      slugs = p.slugs.map(requireLowercaseExactSlug).sort((left, right) => left.localeCompare(right));
+      if (new Set(slugs).size !== slugs.length) throw new OperationError('invalid_params', 'slugs must not contain duplicates');
+      if (p.after_slug !== undefined) throw new OperationError('invalid_params', 'after_slug is only valid for source-wide enumeration');
+      if (slugs.length > Number(limit)) throw new OperationError('invalid_params', 'limit must cover every reviewed slug');
+    }
+    const afterSlug = p.after_slug === undefined ? undefined : requireLowercaseExactSlug(p.after_slug);
+    try {
+      return await inventoryDeletedPagesExact(ctx.engine, {
+        sourceId: ctx.sourceId || 'default',
+        slugs,
+        limit: Number(limit),
+        afterSlug,
+        minAgeHours: Number(minAgeHours),
+      });
+    } catch (error) {
+      throw new OperationError('storage_error', error instanceof Error ? error.message : String(error));
+    }
+  },
+  cliHints: { name: 'inventory-deleted-pages-exact' },
 };
 
 const get_links: Operation = {
@@ -6151,7 +6201,7 @@ export const operations: Operation[] = [
   get_page, put_page, create_page_file_exact, put_page_file_exact, patch_page_metadata_exact,
   soft_delete_page_exact, delete_page, list_pages,
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)
-  restore_page_exact, restore_page, purge_pages_exact, purge_deleted_pages,
+  restore_page_exact, restore_page, purge_pages_exact, inventory_deleted_pages_exact, purge_deleted_pages,
   // Search
   search, query,
   // v0.36 Phase 2: image-as-query

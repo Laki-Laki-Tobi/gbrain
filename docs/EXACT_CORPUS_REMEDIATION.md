@@ -49,6 +49,17 @@ and therefore also requires this explicit gate.
 
 ## Exact Physical Purge
 
+`inventory_deleted_pages_exact` is the local CLI-only, read-only candidate
+inventory. It never returns page bodies, frontmatter, tags, or other private
+content. It is scoped to the caller's source and returns only a sorted slug,
+tombstone timestamp, content hash, active inbound-link count from any source, age
+eligibility, and a reason. Source-wide mode paginates with `after_slug`; exact
+reviewed `slugs` are bounded to 500 and always return a record for every
+requested slug. Missing and restored slugs are explicit non-candidates rather
+than silently omitted. `min_age_hours` defaults to 72 and is bounded to
+72-8760. The response fingerprint binds the reviewed/enumerated rows and
+request scope for the subsequent `purge_pages_exact` review.
+
 `purge_pages_exact` accepts actions `plan`, `apply`, `verify`, and `rollback`.
 The plan allowlist contains at most 100 entries, each with lowercase `slug`,
 exact `deleted_at`, and exact `content_hash`. The generated fingerprint binds
