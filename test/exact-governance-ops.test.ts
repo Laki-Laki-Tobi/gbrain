@@ -668,8 +668,15 @@ describe('exact corpus page operations', () => {
         expected_content_sha256: 'c'.repeat(64), expected_postimage_content_hash: 'd'.repeat(64),
         file_path: '/tmp/nope',
       }],
-      ['soft_delete_page_exact', { slug: 'projects/old', expected_content_hash: 'a'.repeat(64) }],
-      ['restore_page_exact', { slug: 'projects/old', expected_content_hash: 'a'.repeat(64), expected_deleted_at: new Date().toISOString() }],
+      ['soft_delete_page_exact', {
+        slug: 'projects/old', expected_content_hash: 'a'.repeat(64),
+        expected_preimage_markdown_sha256: 'b'.repeat(64),
+      }],
+      ['restore_page_exact', {
+        slug: 'projects/old', expected_content_hash: 'a'.repeat(64),
+        expected_preimage_markdown_sha256: 'b'.repeat(64),
+        expected_deleted_at: new Date().toISOString(),
+      }],
       ['purge_pages_exact', { action: 'plan', run_id: 'remote-test', allowlist: [] }],
     ];
     for (const [name, params] of cases) {
@@ -788,50 +795,99 @@ describe('exact corpus page operations', () => {
     });
     await engine.addLink('projects/referrer', 'projects/exact-delete', 'context', 'related', 'manual');
     const before = (await engine.getPage('projects/exact-delete'))!;
+    const beforeMarkdownSha256 = await renderedMarkdownSha256(before.slug);
 
     const soft = operationsByName.soft_delete_page_exact;
     await expect(soft.handler(ctx(), {
-      slug: before.slug, expected_content_hash: '0'.repeat(64), require_zero_inbound: true,
+      slug: before.slug, expected_content_hash: '0'.repeat(64),
+      expected_preimage_markdown_sha256: beforeMarkdownSha256, require_zero_inbound: true,
     })).rejects.toThrow('content hash changed');
     await expect(soft.handler(ctx(), {
-      slug: before.slug, expected_content_hash: before.content_hash, require_zero_inbound: true,
+      slug: before.slug, expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: beforeMarkdownSha256, require_zero_inbound: true,
     })).rejects.toThrow('zero-inbound gate failed');
     await engine.executeRaw(`DELETE FROM links WHERE to_page_id = $1::int`, [before.id]);
 
     const deleted = await soft.handler(ctx(), {
-      slug: before.slug, expected_content_hash: before.content_hash, require_zero_inbound: true,
+      slug: before.slug, expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: beforeMarkdownSha256, require_zero_inbound: true,
     }) as any;
     expect(deleted.status).toBe('soft_deleted');
     expect((await engine.getPage(before.slug))).toBeNull();
     const tombstone = (await engine.getPage(before.slug, { includeDeleted: true }))!;
     expect(tombstone.deleted_at).toBeTruthy();
     await expect(soft.handler(ctx(), {
-      slug: before.slug, expected_content_hash: before.content_hash, require_zero_inbound: true,
+      slug: before.slug, expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: beforeMarkdownSha256, require_zero_inbound: true,
     })).rejects.toThrow('accept_ambiguous_commit=true');
     expect((await soft.handler(ctx(), {
-      slug: before.slug, expected_content_hash: before.content_hash, require_zero_inbound: true,
+      slug: before.slug, expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: beforeMarkdownSha256, require_zero_inbound: true,
       accept_ambiguous_commit: true,
     }) as any).recovered_after_ambiguous_commit).toBe(true);
 
     const restore = operationsByName.restore_page_exact;
     await expect(restore.handler(ctx(), {
       slug: before.slug, expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: beforeMarkdownSha256,
       expected_deleted_at: new Date(tombstone.deleted_at!.getTime() + 1000).toISOString(),
     })).rejects.toThrow('deleted identity changed');
     const restored = await restore.handler(ctx(), {
       slug: before.slug, expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: beforeMarkdownSha256,
       expected_deleted_at: tombstone.deleted_at!.toISOString(),
     }) as any;
     expect(restored.status).toBe('restored');
     expect((await engine.getPage(before.slug))?.content_hash).toBe(before.content_hash);
     await expect(restore.handler(ctx(), {
       slug: before.slug, expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: beforeMarkdownSha256,
       expected_deleted_at: tombstone.deleted_at!.toISOString(),
     })).rejects.toThrow('already active');
     expect((await restore.handler(ctx(), {
       slug: before.slug, expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: beforeMarkdownSha256,
       expected_deleted_at: tombstone.deleted_at!.toISOString(), accept_ambiguous_commit: true,
     }) as any).recovered_after_ambiguous_commit).toBe(true);
+  });
+
+  test('soft-delete and restore reject rendered-markdown drift inside the exact identity', async () => {
+    await engine.putPage('projects/rendered-drift', {
+      type: 'note', title: 'Rendered drift', compiled_truth: 'stable body', timeline: '', frontmatter: {},
+    });
+    const page = (await engine.getPage('projects/rendered-drift'))!;
+    const approvedMarkdownSha256 = await renderedMarkdownSha256(page.slug);
+    await engine.executeRaw(
+      `UPDATE pages SET title = $1 WHERE source_id = 'default' AND slug = $2`,
+      ['Unapproved title', page.slug],
+    );
+    await expect(operationsByName.soft_delete_page_exact.handler(ctx(), {
+      slug: page.slug,
+      expected_content_hash: page.content_hash,
+      expected_preimage_markdown_sha256: approvedMarkdownSha256,
+      require_zero_inbound: true,
+    })).rejects.toThrow('rendered markdown changed');
+    expect((await engine.getPage(page.slug))?.deleted_at).toBeNull();
+
+    const driftedMarkdownSha256 = await renderedMarkdownSha256(page.slug);
+    await operationsByName.soft_delete_page_exact.handler(ctx(), {
+      slug: page.slug,
+      expected_content_hash: page.content_hash,
+      expected_preimage_markdown_sha256: driftedMarkdownSha256,
+      require_zero_inbound: true,
+    });
+    const tombstone = (await engine.getPage(page.slug, { includeDeleted: true }))!;
+    await engine.executeRaw(
+      `UPDATE pages SET title = $1 WHERE source_id = 'default' AND slug = $2`,
+      ['Changed while deleted', page.slug],
+    );
+    await expect(operationsByName.restore_page_exact.handler(ctx(), {
+      slug: page.slug,
+      expected_content_hash: page.content_hash,
+      expected_preimage_markdown_sha256: driftedMarkdownSha256,
+      expected_deleted_at: tombstone.deleted_at!.toISOString(),
+    })).rejects.toThrow('rendered markdown changed');
+    expect((await engine.getPage(page.slug, { includeDeleted: true }))?.deleted_at).toBeTruthy();
   });
 
   test('create-only atomically preserves exactly one concurrent creator', async () => {
@@ -891,9 +947,11 @@ describe('exact corpus page operations', () => {
       type: 'note', title: 'Race referrer', compiled_truth: 'referrer', timeline: '', frontmatter: {},
     });
     const target = (await engine.getPage('projects/race-target'))!;
+    const targetMarkdownSha256 = await renderedMarkdownSha256(target.slug);
     const outcomes = await Promise.allSettled([
       operationsByName.soft_delete_page_exact.handler(ctx(), {
-        slug: target.slug, expected_content_hash: target.content_hash, require_zero_inbound: true,
+        slug: target.slug, expected_content_hash: target.content_hash,
+        expected_preimage_markdown_sha256: targetMarkdownSha256, require_zero_inbound: true,
       }),
       engine.addLink('projects/race-referrer', target.slug, 'racing link', 'related', 'manual'),
     ]);
@@ -916,6 +974,7 @@ describe('exact corpus page operations', () => {
     });
     await engine.softDeletePage('projects/restore-race-referrer');
     const target = (await engine.getPage('projects/restore-race-target'))!;
+    const targetMarkdownSha256 = await renderedMarkdownSha256(target.slug);
     const edge = {
       from_slug: 'projects/restore-race-referrer',
       to_slug: target.slug,
@@ -928,7 +987,8 @@ describe('exact corpus page operations', () => {
     };
     const restore = engine.restoreLinkExact(edge, { sourceId: 'default' });
     const deletion = operationsByName.soft_delete_page_exact.handler(ctx(), {
-      slug: target.slug, expected_content_hash: target.content_hash, require_zero_inbound: true,
+      slug: target.slug, expected_content_hash: target.content_hash,
+      expected_preimage_markdown_sha256: targetMarkdownSha256, require_zero_inbound: true,
     });
     const outcomes = await Promise.allSettled([restore, deletion]);
     expect(outcomes[0].status).toBe('fulfilled');

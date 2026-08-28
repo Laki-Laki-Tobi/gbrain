@@ -18,7 +18,7 @@ import {
   stableImportFrontmatter,
   type ParsedPage,
 } from './import-file.ts';
-import { parseMarkdown } from './markdown.ts';
+import { parseMarkdown, serializePageToMarkdown } from './markdown.ts';
 import { writePageThrough } from './write-through.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
@@ -1564,6 +1564,7 @@ const soft_delete_page_exact: Operation = {
   params: {
     slug: { type: 'string', required: true },
     expected_content_hash: { type: 'string', required: true },
+    expected_preimage_markdown_sha256: { type: 'string', required: true },
     require_zero_inbound: { type: 'boolean' },
     accept_ambiguous_commit: { type: 'boolean' },
   },
@@ -1576,8 +1577,12 @@ const soft_delete_page_exact: Operation = {
     }
     const slug = requireLowercaseExactSlug(p.slug);
     const expectedContentHash = requireExactString(p, 'expected_content_hash');
+    const expectedPreimageMarkdownSha256 = requireExactString(p, 'expected_preimage_markdown_sha256');
     if (!/^[a-f0-9]{64}$/.test(expectedContentHash)) {
       throw new OperationError('invalid_params', 'expected_content_hash must be lowercase sha256 hex');
+    }
+    if (!/^[a-f0-9]{64}$/.test(expectedPreimageMarkdownSha256)) {
+      throw new OperationError('invalid_params', 'expected_preimage_markdown_sha256 must be lowercase sha256 hex');
     }
     const sourceId = ctx.sourceId || 'default';
     const before = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
@@ -1585,6 +1590,13 @@ const soft_delete_page_exact: Operation = {
     if (before.source_id !== sourceId) throw new OperationError('storage_error', `source identity drift for "${slug}"`);
     if (before.content_hash !== expectedContentHash) {
       throw new OperationError('storage_error', `soft_delete_page_exact drift: content hash changed for "${slug}"`);
+    }
+    const beforeTags = await ctx.engine.getTags(slug, { sourceId });
+    const beforeMarkdownSha256 = createHash('sha256')
+      .update(serializePageToMarkdown(before, beforeTags))
+      .digest('hex');
+    if (beforeMarkdownSha256 !== expectedPreimageMarkdownSha256) {
+      throw new OperationError('storage_error', `soft_delete_page_exact drift: rendered markdown changed for "${slug}"`);
     }
     if (before.deleted_at) {
       if (p.accept_ambiguous_commit !== true) {
@@ -1596,7 +1608,13 @@ const soft_delete_page_exact: Operation = {
       };
     }
     if (ctx.dryRun) {
-      return { dry_run: true, action: 'soft_delete_page_exact', slug, require_zero_inbound: p.require_zero_inbound === true };
+      return {
+        dry_run: true,
+        action: 'soft_delete_page_exact',
+        slug,
+        expected_preimage_markdown_sha256: expectedPreimageMarkdownSha256,
+        require_zero_inbound: p.require_zero_inbound === true,
+      };
     }
 
     try {
@@ -1618,6 +1636,17 @@ const soft_delete_page_exact: Operation = {
         if (locked[0].deleted_at) {
           throw new Error(`soft-delete state became ambiguous for ${slug}`);
         }
+        const lockedPage = await tx.getPage(slug, { sourceId, includeDeleted: true });
+        if (!lockedPage || lockedPage.deleted_at) {
+          throw new Error(`soft-delete rendered preimage changed for ${slug}`);
+        }
+        const lockedTags = await tx.getTags(slug, { sourceId });
+        const lockedMarkdownSha256 = createHash('sha256')
+          .update(serializePageToMarkdown(lockedPage, lockedTags))
+          .digest('hex');
+        if (lockedMarkdownSha256 !== expectedPreimageMarkdownSha256) {
+          throw new Error(`soft-delete rendered markdown changed for ${slug}`);
+        }
         if (p.require_zero_inbound === true) {
           const [row] = await tx.executeRaw<{ inbound_count: number | string }>(
             `SELECT count(*)::bigint AS inbound_count FROM links WHERE to_page_id = $1::int`,
@@ -1637,7 +1666,15 @@ const soft_delete_page_exact: Operation = {
       });
     } catch (error) {
       const afterError = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
-      if (afterError?.deleted_at && afterError.content_hash === expectedContentHash) {
+      const afterErrorTags = afterError ? await ctx.engine.getTags(slug, { sourceId }) : [];
+      const afterErrorMarkdownSha256 = afterError
+        ? createHash('sha256').update(serializePageToMarkdown(afterError, afterErrorTags)).digest('hex')
+        : '';
+      if (afterError?.deleted_at
+        && afterError.id === before.id
+        && afterError.source_id === sourceId
+        && afterError.content_hash === expectedContentHash
+        && afterErrorMarkdownSha256 === expectedPreimageMarkdownSha256) {
         if (p.accept_ambiguous_commit !== true) {
           throw new OperationError('storage_error', 'ambiguous soft-delete commit requires accept_ambiguous_commit=true after operator review');
         }
@@ -1665,6 +1702,7 @@ const restore_page_exact: Operation = {
   params: {
     slug: { type: 'string', required: true },
     expected_content_hash: { type: 'string', required: true },
+    expected_preimage_markdown_sha256: { type: 'string', required: true },
     expected_deleted_at: { type: 'string', required: true },
     accept_ambiguous_commit: { type: 'boolean' },
   },
@@ -1677,8 +1715,12 @@ const restore_page_exact: Operation = {
     }
     const slug = requireLowercaseExactSlug(p.slug);
     const expectedContentHash = requireExactString(p, 'expected_content_hash');
+    const expectedPreimageMarkdownSha256 = requireExactString(p, 'expected_preimage_markdown_sha256');
     if (!/^[a-f0-9]{64}$/.test(expectedContentHash)) {
       throw new OperationError('invalid_params', 'expected_content_hash must be lowercase sha256 hex');
+    }
+    if (!/^[a-f0-9]{64}$/.test(expectedPreimageMarkdownSha256)) {
+      throw new OperationError('invalid_params', 'expected_preimage_markdown_sha256 must be lowercase sha256 hex');
     }
     const rawDeletedAt = requireExactString(p, 'expected_deleted_at');
     const parsedDeletedAt = Date.parse(rawDeletedAt);
@@ -1691,6 +1733,13 @@ const restore_page_exact: Operation = {
     if (before.content_hash !== expectedContentHash) {
       throw new OperationError('storage_error', `restore_page_exact drift: content hash changed for "${slug}"`);
     }
+    const beforeTags = await ctx.engine.getTags(slug, { sourceId });
+    const beforeMarkdownSha256 = createHash('sha256')
+      .update(serializePageToMarkdown(before, beforeTags))
+      .digest('hex');
+    if (beforeMarkdownSha256 !== expectedPreimageMarkdownSha256) {
+      throw new OperationError('storage_error', `restore_page_exact drift: rendered markdown changed for "${slug}"`);
+    }
     if (!before.deleted_at) {
       if (p.accept_ambiguous_commit === true) {
         return { status: 'restored', slug, content_hash: expectedContentHash, recovered_after_ambiguous_commit: true };
@@ -1700,10 +1749,47 @@ const restore_page_exact: Operation = {
     if (before.deleted_at.toISOString() !== expectedDeletedAt) {
       throw new OperationError('storage_error', `restore_page_exact drift: deleted identity changed for "${slug}"`);
     }
-    if (ctx.dryRun) return { dry_run: true, action: 'restore_page_exact', slug, expected_deleted_at: expectedDeletedAt };
+    if (ctx.dryRun) {
+      return {
+        dry_run: true,
+        action: 'restore_page_exact',
+        slug,
+        expected_preimage_markdown_sha256: expectedPreimageMarkdownSha256,
+        expected_deleted_at: expectedDeletedAt,
+      };
+    }
 
     try {
       await ctx.engine.transaction(async (tx) => {
+        const locked = await tx.executeRaw<{
+          id: number | string;
+          content_hash: string;
+          deleted_at: Date | string | null;
+        }>(`
+          SELECT id, content_hash, deleted_at
+            FROM pages
+           WHERE source_id = $1 AND slug = $2
+           FOR UPDATE
+        `, [sourceId, slug]);
+        const lockedDeletedAt = locked[0]?.deleted_at
+          ? new Date(locked[0].deleted_at).toISOString()
+          : null;
+        if (locked.length !== 1 || Number(locked[0].id) !== before.id
+          || locked[0].content_hash !== expectedContentHash
+          || lockedDeletedAt !== expectedDeletedAt) {
+          throw new Error(`restore identity changed for ${slug}`);
+        }
+        const lockedPage = await tx.getPage(slug, { sourceId, includeDeleted: true });
+        if (!lockedPage || !lockedPage.deleted_at) {
+          throw new Error(`restore rendered preimage changed for ${slug}`);
+        }
+        const lockedTags = await tx.getTags(slug, { sourceId });
+        const lockedMarkdownSha256 = createHash('sha256')
+          .update(serializePageToMarkdown(lockedPage, lockedTags))
+          .digest('hex');
+        if (lockedMarkdownSha256 !== expectedPreimageMarkdownSha256) {
+          throw new Error(`restore rendered markdown changed for ${slug}`);
+        }
         const changed = await tx.executeRaw<{ id: number | string }>(`
           UPDATE pages SET deleted_at = NULL
            WHERE id = $1::int AND source_id = $2 AND slug = $3
@@ -1714,7 +1800,16 @@ const restore_page_exact: Operation = {
       });
     } catch (error) {
       const afterError = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
-      if (afterError && !afterError.deleted_at && afterError.content_hash === expectedContentHash) {
+      const afterErrorTags = afterError ? await ctx.engine.getTags(slug, { sourceId }) : [];
+      const afterErrorMarkdownSha256 = afterError
+        ? createHash('sha256').update(serializePageToMarkdown(afterError, afterErrorTags)).digest('hex')
+        : '';
+      if (afterError
+        && !afterError.deleted_at
+        && afterError.id === before.id
+        && afterError.source_id === sourceId
+        && afterError.content_hash === expectedContentHash
+        && afterErrorMarkdownSha256 === expectedPreimageMarkdownSha256) {
         if (p.accept_ambiguous_commit !== true) {
           throw new OperationError('storage_error', 'ambiguous restore commit requires accept_ambiguous_commit=true after operator review');
         }
