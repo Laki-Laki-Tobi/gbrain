@@ -30,6 +30,23 @@ export interface PurgePagesExactArgs {
   acceptAmbiguousCommit: boolean;
 }
 
+export interface InventoryDeletedPagesExactArgs {
+  sourceId: string;
+  slugs?: string[];
+  limit: number;
+  afterSlug?: string;
+  minAgeHours: number;
+}
+
+interface DeletedPageInventoryDbRow {
+  slug: string;
+  state: 'deleted' | 'missing' | 'restored';
+  deleted_at: Date | string | null;
+  content_hash: string | null;
+  active_inbound_count: number | string;
+  age_eligible: boolean | null;
+}
+
 type JsonRow = Record<string, unknown>;
 
 interface PurgeBackup {
@@ -105,6 +122,114 @@ function sha256(value: string | Uint8Array): string {
 
 function fingerprint(value: unknown): string {
   return sha256(stableJson(value));
+}
+
+function inventoryRow(row: DeletedPageInventoryDbRow): Record<string, unknown> {
+  const state = row.state;
+  const activeInboundCount = Number(row.active_inbound_count);
+  if (!Number.isFinite(activeInboundCount) || activeInboundCount < 0) {
+    throw new Error('inventory active inbound count is invalid');
+  }
+  const ageEligible = row.age_eligible === true;
+  const reason = state === 'missing'
+    ? 'missing'
+    : state === 'restored'
+    ? 'restored'
+    : !ageEligible && activeInboundCount > 0
+    ? 'too_young_and_active_inbound'
+    : !ageEligible
+    ? 'too_young'
+    : activeInboundCount > 0
+    ? 'active_inbound'
+    : 'eligible';
+  return {
+    slug: row.slug,
+    deleted_at: row.deleted_at === null ? null : new Date(row.deleted_at).toISOString(),
+    content_hash: row.content_hash,
+    active_inbound_count: activeInboundCount,
+    age_eligible: state === 'deleted' ? ageEligible : false,
+    reason,
+  };
+}
+
+/** Read-only, source-scoped purge inventory. Exact reviewed requests retain
+ * missing/restored entries so an operator cannot mistake omission for approval. */
+export async function inventoryDeletedPagesExact(
+  engine: BrainEngine,
+  args: InventoryDeletedPagesExactArgs,
+): Promise<Record<string, unknown>> {
+  const exact = args.slugs !== undefined;
+  const rows = exact
+    ? await engine.executeRaw<DeletedPageInventoryDbRow>(
+      `WITH requested AS (
+         SELECT unnest($2::text[]) AS slug
+       )
+       SELECT r.slug,
+              CASE WHEN p.id IS NULL THEN 'missing'
+                   WHEN p.deleted_at IS NULL THEN 'restored'
+                   ELSE 'deleted' END AS state,
+              p.deleted_at,
+              CASE WHEN p.deleted_at IS NOT NULL THEN p.content_hash ELSE NULL END AS content_hash,
+              CASE WHEN p.deleted_at IS NULL THEN 0 ELSE COALESCE((
+                SELECT count(*)::int
+                 FROM links l
+                  JOIN pages f ON f.id = l.from_page_id
+                 WHERE l.to_page_id = p.id
+                   AND f.deleted_at IS NULL
+              ), 0)::int END AS active_inbound_count,
+              p.deleted_at <= now() - ($3::int * interval '1 hour') AS age_eligible
+         FROM requested r
+         LEFT JOIN pages p ON p.source_id = $1 AND p.slug = r.slug
+        ORDER BY r.slug`,
+      [args.sourceId, args.slugs, args.minAgeHours],
+    )
+    : await engine.executeRaw<DeletedPageInventoryDbRow>(
+      `SELECT p.slug,
+              'deleted' AS state,
+              p.deleted_at,
+              p.content_hash,
+              COALESCE((
+                SELECT count(*)::int
+                 FROM links l
+                  JOIN pages f ON f.id = l.from_page_id
+                 WHERE l.to_page_id = p.id
+                   AND f.deleted_at IS NULL
+              ), 0)::int AS active_inbound_count,
+              p.deleted_at <= now() - ($3::int * interval '1 hour') AS age_eligible
+         FROM pages p
+        WHERE p.source_id = $1
+          AND p.deleted_at IS NOT NULL
+          AND ($2::text IS NULL OR p.slug > $2)
+        ORDER BY p.slug
+        LIMIT $4`,
+      [args.sourceId, args.afterSlug ?? null, args.minAgeHours, args.limit + 1],
+    );
+  const hasMore = !exact && rows.length > args.limit;
+  const visible = hasMore ? rows.slice(0, args.limit) : rows;
+  const inventory = visible.map(inventoryRow);
+  const counts = {
+    requested: exact ? args.slugs!.length : null,
+    returned: inventory.length,
+    deleted: visible.filter((row) => row.state === 'deleted').length,
+    eligible: inventory.filter((row) => row.reason === 'eligible').length,
+    blocked: inventory.filter((row) => row.reason === 'too_young' || row.reason === 'active_inbound' || row.reason === 'too_young_and_active_inbound').length,
+    missing: visible.filter((row) => row.state === 'missing').length,
+    restored: visible.filter((row) => row.state === 'restored').length,
+  };
+  return {
+    source_id: args.sourceId,
+    rows: inventory,
+    counts,
+    next_cursor: hasMore ? visible[visible.length - 1]!.slug : null,
+    fingerprint: fingerprint({
+      source_id: args.sourceId,
+      exact_review: exact,
+      reviewed_slugs: args.slugs ?? null,
+      after_slug: args.afterSlug ?? null,
+      min_age_hours: args.minAgeHours,
+      rows: inventory,
+    }),
+  };
 }
 
 function backupRoot(): string {

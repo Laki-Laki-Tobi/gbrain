@@ -2,6 +2,16 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.13] - 2026-08-28
+
+### Added
+- `inventory_deleted_pages_exact` provides a local-only, source-scoped,
+  read-only purge inventory with exact reviewed-slug mode and deterministic
+  pagination. It exposes no page bodies and counts active inbound references
+  across sources before a candidate can reach `purge_pages_exact`.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.12] - 2026-08-28
 
 ### Added

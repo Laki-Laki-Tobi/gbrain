@@ -7,6 +7,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { computeImportContentHash } from '../src/core/import-file.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../src/core/markdown.ts';
 import { operationsByName, type OperationContext } from '../src/core/operations.ts';
+import { inventoryDeletedPagesExact } from '../src/core/exact-corpus-remediation.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
@@ -28,6 +29,18 @@ async function counts(): Promise<{ versions: number; chunks: number }> {
             (SELECT count(*) FROM content_chunks) AS chunks`,
   );
   return { versions: Number(row.versions), chunks: Number(row.chunks) };
+}
+
+async function seedDeletedInventoryPage(slug: string, body: string, hoursAgo: number, sourceId = 'default') {
+  await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: body, timeline: '', frontmatter: {} }, { sourceId });
+  await engine.softDeletePage(slug, { sourceId });
+  await engine.executeRaw(
+    `UPDATE pages
+        SET deleted_at = now() - ($1::int * interval '1 hour')
+      WHERE source_id = $2 AND slug = $3`,
+    [hoursAgo, sourceId, slug],
+  );
+  return (await engine.getPage(slug, { sourceId, includeDeleted: true }))!;
 }
 
 function canonicalPostimageHash(slug: string, content: string): string {
@@ -1309,5 +1322,108 @@ describe('purge_pages_exact', () => {
     } finally {
       await rm(home, { recursive: true, force: true });
     }
+  });
+});
+
+describe('inventory_deleted_pages_exact', () => {
+  test('is local-only read-only and rejects remote callers before touching the engine', async () => {
+    const op = operationsByName.inventory_deleted_pages_exact;
+    expect(op.localOnly).toBe(true);
+    expect(op.scope).toBe('admin');
+    expect(op.mutating).toBe(false);
+    const explodingEngine = new Proxy({} as PGLiteEngine, { get() { throw new Error('engine must not be touched'); } });
+    await expect(op.handler({ ...ctx(), engine: explodingEngine, remote: true }, {})).rejects.toThrow('local-only');
+  });
+
+  test('returns sorted exact reviewed states without leaking page content and source-scopes the lookup', async () => {
+    const op = operationsByName.inventory_deleted_pages_exact;
+    const deleted = await seedDeletedInventoryPage('archive/inventory-deleted', 'private inventory body', 100);
+    await engine.putPage('archive/inventory-restored', {
+      type: 'note', title: 'Restored', compiled_truth: 'restored private body', timeline: '', frontmatter: {},
+    });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+      ['inventory-other'],
+    );
+    await seedDeletedInventoryPage('archive/inventory-deleted', 'foreign private body', 100, 'inventory-other');
+    await engine.putPage('projects/inventory-foreign-referrer', {
+      type: 'note', title: 'Foreign referrer', compiled_truth: 'foreign active', timeline: '', frontmatter: {},
+    }, { sourceId: 'inventory-other' });
+    const foreignReferrer = (await engine.getPage('projects/inventory-foreign-referrer', { sourceId: 'inventory-other' }))!;
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+       VALUES ($1::int, $2::int, 'related', 'foreign dependency', 'manual')`,
+      [foreignReferrer.id, deleted.id],
+    );
+
+    const result = await op.handler(ctx(), {
+      slugs: ['archive/inventory-restored', 'archive/inventory-missing', 'archive/inventory-deleted'],
+      limit: 3,
+    }) as any;
+    expect(result.source_id).toBe('default');
+    expect(result.rows.map((row: any) => row.slug)).toEqual([
+      'archive/inventory-deleted', 'archive/inventory-missing', 'archive/inventory-restored',
+    ]);
+    expect(result.rows.find((row: any) => row.slug === deleted.slug)).toMatchObject({ reason: 'active_inbound', active_inbound_count: 1, age_eligible: true });
+    expect(result.rows.find((row: any) => row.slug === 'archive/inventory-missing')).toMatchObject({ reason: 'missing', deleted_at: null, content_hash: null });
+    expect(result.rows.find((row: any) => row.slug === 'archive/inventory-restored')).toMatchObject({ reason: 'restored', deleted_at: null, content_hash: null });
+    expect(Object.keys(result.rows[0]).sort()).toEqual([
+      'active_inbound_count', 'age_eligible', 'content_hash', 'deleted_at', 'reason', 'slug',
+    ]);
+    expect(JSON.stringify(result)).not.toContain('private inventory body');
+    expect(JSON.stringify(result)).not.toContain('foreign private body');
+    expect(result.counts).toMatchObject({ requested: 3, deleted: 1, missing: 1, restored: 1 });
+  });
+
+  test('fails closed on an invalid active inbound count', async () => {
+    await expect(inventoryDeletedPagesExact({
+      executeRaw: async () => [{
+        slug: 'archive/inventory-invalid-count', state: 'deleted', deleted_at: new Date(), content_hash: 'a'.repeat(64),
+        active_inbound_count: 'NaN', age_eligible: true,
+      }],
+    } as any, {
+      sourceId: 'default', limit: 1, minAgeHours: 72,
+    })).rejects.toThrow('active inbound count is invalid');
+  });
+
+  test('reports age and active inbound gates, validates reviewed input, and paginates source-wide rows', async () => {
+    const op = operationsByName.inventory_deleted_pages_exact;
+    await seedDeletedInventoryPage('archive/inventory-boundary', 'boundary', 72);
+    await seedDeletedInventoryPage('archive/inventory-young', 'young', 71);
+    const blocked = await seedDeletedInventoryPage('archive/inventory-blocked', 'blocked', 100);
+    await engine.putPage('projects/inventory-active-referrer', {
+      type: 'note', title: 'Referrer', compiled_truth: 'active', timeline: '', frontmatter: {},
+    });
+    const referrer = (await engine.getPage('projects/inventory-active-referrer'))!;
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+       VALUES ($1::int, $2::int, 'related', 'active dependency', 'manual')`,
+      [referrer.id, blocked.id],
+    );
+    const reviewed = await op.handler(ctx(), {
+      slugs: ['archive/inventory-young', 'archive/inventory-blocked', 'archive/inventory-boundary'], limit: 3,
+    }) as any;
+    expect(reviewed.rows.find((row: any) => row.slug === 'archive/inventory-boundary')).toMatchObject({ reason: 'eligible', age_eligible: true });
+    expect(reviewed.rows.find((row: any) => row.slug === 'archive/inventory-young')).toMatchObject({ reason: 'too_young', age_eligible: false });
+    expect(reviewed.rows.find((row: any) => row.slug === 'archive/inventory-blocked')).toMatchObject({ reason: 'active_inbound', active_inbound_count: 1 });
+
+    await expect(op.handler(ctx(), { slugs: ['Archive/Upper'], limit: 1 })).rejects.toThrow('lowercase');
+    await expect(op.handler(ctx(), { slugs: ['archive/a', 'archive/a'], limit: 2 })).rejects.toThrow('duplicates');
+    await expect(op.handler(ctx(), { slugs: Array.from({ length: 501 }, (_, i) => `archive/${i}`), limit: 500 })).rejects.toThrow('between 1 and 500');
+    await expect(op.handler(ctx(), { limit: 0 })).rejects.toThrow('between 1 and 500');
+    await expect(op.handler(ctx(), { min_age_hours: 71 })).rejects.toThrow('between 72 and 8760');
+
+    await engine.executeRaw(`DELETE FROM links`);
+    await engine.executeRaw(`DELETE FROM pages`);
+    for (const slug of ['archive/inventory-page-a', 'archive/inventory-page-b', 'archive/inventory-page-c']) {
+      await seedDeletedInventoryPage(slug, slug, 100);
+    }
+    const first = await op.handler(ctx(), { limit: 2 }) as any;
+    expect(first.rows.map((row: any) => row.slug)).toEqual(['archive/inventory-page-a', 'archive/inventory-page-b']);
+    expect(first.next_cursor).toBe('archive/inventory-page-b');
+    const second = await op.handler(ctx(), { limit: 2, after_slug: first.next_cursor }) as any;
+    expect(second.rows.map((row: any) => row.slug)).toEqual(['archive/inventory-page-c']);
+    expect(second.next_cursor).toBeNull();
+    expect(typeof first.fingerprint).toBe('string');
   });
 });
