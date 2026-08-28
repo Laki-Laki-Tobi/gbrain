@@ -3514,30 +3514,43 @@ export class PostgresEngine implements BrainEngine {
   }
 
   // Tags
-  async addTag(slug: string, tag: string, opts?: { sourceId?: string }): Promise<void> {
-    const sql = this.sql;
-    const sourceId = opts?.sourceId ?? 'default';
-    // Verify page exists before attempting insert (ON CONFLICT DO NOTHING
-    // swallows the "already tagged" case, but we still need to detect missing
-    // pages). Source-scoped lookup — pre-v0.18 the bare-slug subquery returned
-    // multiple rows in multi-source brains and crashed with Postgres 21000.
-    const page = await sql`SELECT id FROM pages WHERE slug = ${slug} AND source_id = ${sourceId}`;
-    if (page.length === 0) throw new Error(`addTag failed: page "${slug}" (source=${sourceId}) not found`);
-    await sql`
-      INSERT INTO tags (page_id, tag)
-      VALUES (${page[0].id}, ${tag})
-      ON CONFLICT (page_id, tag) DO NOTHING
+  private async withTagWriteTransaction<T>(fn: (engine: PostgresEngine) => Promise<T>): Promise<T> {
+    if ((this as unknown as Record<PropertyKey, unknown>)[TRANSACTION_SCOPE] === true) return fn(this);
+    return this.transaction((tx) => fn(tx as PostgresEngine));
+  }
+
+  private async lockTagPage(slug: string, sourceId: string, required: boolean): Promise<number | string | null> {
+    const rows = await this.sql`
+      SELECT id FROM pages
+       WHERE slug = ${slug} AND source_id = ${sourceId}
+       FOR UPDATE
     `;
+    if (rows.length === 0) {
+      if (required) throw new Error(`addTag failed: page "${slug}" (source=${sourceId}) not found`);
+      return null;
+    }
+    return rows[0].id as number | string;
+  }
+
+  async addTag(slug: string, tag: string, opts?: { sourceId?: string }): Promise<void> {
+    const sourceId = opts?.sourceId ?? 'default';
+    await this.withTagWriteTransaction(async (tx) => {
+      const pageId = await tx.lockTagPage(slug, sourceId, true);
+      await tx.sql`
+        INSERT INTO tags (page_id, tag)
+        VALUES (${pageId}, ${tag})
+        ON CONFLICT (page_id, tag) DO NOTHING
+      `;
+    });
   }
 
   async removeTag(slug: string, tag: string, opts?: { sourceId?: string }): Promise<void> {
-    const sql = this.sql;
     const sourceId = opts?.sourceId ?? 'default';
-    await sql`
-      DELETE FROM tags
-      WHERE page_id = (SELECT id FROM pages WHERE slug = ${slug} AND source_id = ${sourceId})
-        AND tag = ${tag}
-    `;
+    await this.withTagWriteTransaction(async (tx) => {
+      const pageId = await tx.lockTagPage(slug, sourceId, false);
+      if (pageId == null) return;
+      await tx.sql`DELETE FROM tags WHERE page_id = ${pageId} AND tag = ${tag}`;
+    });
   }
 
   async getTags(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<string[]> {

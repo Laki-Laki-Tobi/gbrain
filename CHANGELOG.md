@@ -2,6 +2,19 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.11] - 2026-08-28
+
+### Fixed
+- `put_page_file_exact` now requires the exact active preimage rendered
+  Markdown SHA-256 in addition to the canonical DB content hash. Both are
+  rechecked under the same page-row lock before version or postimage writes,
+  preventing a raw-only metadata race from being overwritten.
+- Tag add/remove writers now use the same page-row lock protocol, so an exact
+  merge cannot erase a concurrent tag mutation after validating the rendered
+  preimage.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.10] - 2026-08-28
 
 ### Fixed

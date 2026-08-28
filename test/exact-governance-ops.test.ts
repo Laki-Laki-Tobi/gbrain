@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { computeImportContentHash } from '../src/core/import-file.ts';
-import { parseMarkdown } from '../src/core/markdown.ts';
+import { parseMarkdown, serializePageToMarkdown } from '../src/core/markdown.ts';
 import { operationsByName, type OperationContext } from '../src/core/operations.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -40,6 +40,13 @@ function canonicalPostimageHash(slug: string, content: string): string {
     frontmatter: parsed.frontmatter,
     tags: parsed.tags,
   });
+}
+
+async function renderedMarkdownSha256(slug: string): Promise<string> {
+  const page = await engine.getPage(slug, { sourceId: 'default', includeDeleted: true });
+  if (!page) throw new Error(`missing page: ${slug}`);
+  const tags = await engine.getTags(slug, { sourceId: 'default' });
+  return createHash('sha256').update(serializePageToMarkdown(page, tags)).digest('hex');
 }
 
 beforeAll(async () => {
@@ -294,6 +301,7 @@ describe('put_page_file_exact', () => {
     expect(op.localOnly).toBe(true);
     expect(op.scope).toBe('admin');
     expect(op.mutating).toBe(true);
+    expect(op.params.expected_preimage_markdown_sha256).toMatchObject({ required: true });
 
     await engine.putPage('projects/file-target', {
       type: 'note', title: 'Target', compiled_truth: 'target', timeline: '', frontmatter: {},
@@ -316,6 +324,7 @@ describe('put_page_file_exact', () => {
     const exactParams = {
       slug: before.slug,
       expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: await renderedMarkdownSha256(before.slug),
       expected_content_sha256: fileSha,
       expected_postimage_content_hash: postimageHash,
       file_path: filePath,
@@ -409,10 +418,12 @@ describe('put_page_file_exact', () => {
     const validContent = '---\ntype: note\ntitle: Valid draft\n---\n\nValid body.\n';
     const fileSha = createHash('sha256').update(validContent).digest('hex');
     const postimageHash = canonicalPostimageHash(before.slug, validContent);
+    const renderedPreimageSha = await renderedMarkdownSha256(before.slug);
 
     const params = (path: string) => ({
       slug: before.slug,
       expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: renderedPreimageSha,
       expected_content_sha256: fileSha,
       expected_postimage_content_hash: postimageHash,
       file_path: path,
@@ -456,6 +467,7 @@ describe('put_page_file_exact', () => {
     const params = {
       slug: before.slug,
       expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: await renderedMarkdownSha256(before.slug),
       expected_content_sha256: fileSha,
       expected_postimage_content_hash: postimageHash,
       file_path: filePath,
@@ -504,6 +516,7 @@ describe('put_page_file_exact', () => {
       await expect(op.handler(ctx(), {
         slug: before.slug,
         expected_content_hash: before.content_hash,
+        expected_preimage_markdown_sha256: await renderedMarkdownSha256(before.slug),
         expected_content_sha256: createHash('sha256').update(content).digest('hex'),
         expected_postimage_content_hash: canonicalPostimageHash(before.slug, content),
         file_path: filePath,
@@ -518,6 +531,108 @@ describe('put_page_file_exact', () => {
       )).toEqual([]);
     } finally {
       engine.transaction = originalTransaction;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects a raw-only preimage race under the same locked DB content hash', async () => {
+    const op = operationsByName.put_page_file_exact;
+    await engine.putPage('projects/exact-raw-preimage-race', {
+      type: 'note', title: 'Initial', compiled_truth: 'initial body', timeline: '',
+      frontmatter: { captured_at: '2026-08-28T00:00:00Z' },
+    });
+    const before = (await engine.getPage('projects/exact-raw-preimage-race'))!;
+    const beforeMarkdownSha256 = await renderedMarkdownSha256(before.slug);
+    const baselineCounts = await counts();
+    const dir = await mkdtemp(join(tmpdir(), 'gbrain-exact-raw-preimage-race-'));
+    const filePath = join(dir, 'approved.md');
+    const marker = 'raw-race-approved-draft-must-not-land';
+    const content = `---\ntype: note\ntitle: Approved\n---\n\n${marker}\n`;
+    const originalTransaction = engine.transaction;
+    let injected = false;
+    try {
+      await writeFile(filePath, content, { mode: 0o600 });
+      engine.transaction = async function <T>(fn: (tx: import('../src/core/engine.ts').BrainEngine) => Promise<T>): Promise<T> {
+        if (!injected) {
+          injected = true;
+          await engine.putPage(before.slug, {
+            type: before.type,
+            title: before.title,
+            compiled_truth: before.compiled_truth,
+            timeline: before.timeline,
+            frontmatter: { captured_at: '2026-08-28T00:00:01Z' },
+            content_hash: before.content_hash,
+          });
+        }
+        return originalTransaction.call(engine, fn) as Promise<T>;
+      };
+      await expect(op.handler(ctx(), {
+        slug: before.slug,
+        expected_content_hash: before.content_hash,
+        expected_preimage_markdown_sha256: beforeMarkdownSha256,
+        expected_content_sha256: createHash('sha256').update(content).digest('hex'),
+        expected_postimage_content_hash: canonicalPostimageHash(before.slug, content),
+        file_path: filePath,
+      })).rejects.toThrow('preimage markdown drift');
+      const after = (await engine.getPage(before.slug))!;
+      expect(after.content_hash).toBe(before.content_hash);
+      expect(after.frontmatter).toMatchObject({ captured_at: '2026-08-28T00:00:01Z' });
+      expect(after.compiled_truth).not.toContain(marker);
+      expect((await counts()).versions).toBe(baselineCounts.versions);
+    } finally {
+      engine.transaction = originalTransaction;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('serializes a concurrent tag writer behind the exact page-row lock', async () => {
+    const op = operationsByName.put_page_file_exact;
+    const slug = 'projects/exact-tag-race';
+    await engine.putPage(slug, {
+      type: 'note', title: 'Initial', compiled_truth: 'initial body', timeline: '', frontmatter: {},
+    });
+    await engine.addTag(slug, 'baseline-tag');
+    const before = (await engine.getPage(slug))!;
+    const beforeMarkdownSha256 = await renderedMarkdownSha256(slug);
+    const dir = await mkdtemp(join(tmpdir(), 'gbrain-exact-tag-race-'));
+    const filePath = join(dir, 'approved.md');
+    const content = '---\ntype: note\ntitle: Approved\ntags:\n  - approved-tag\n---\n\nApproved body.\n';
+    const originalTransaction = engine.transaction;
+    let concurrentTagWrite: Promise<unknown> = Promise.resolve();
+    let scheduled = false;
+    try {
+      await writeFile(filePath, content, { mode: 0o600 });
+      engine.transaction = async function <T>(fn: (tx: import('../src/core/engine.ts').BrainEngine) => Promise<T>): Promise<T> {
+        return originalTransaction.call(engine, async (tx) => {
+          const originalGetTags = tx.getTags.bind(tx);
+          tx.getTags = async (...args: Parameters<typeof tx.getTags>) => {
+            const tags = await originalGetTags(...args);
+            if (!scheduled) {
+              scheduled = true;
+              concurrentTagWrite = originalTransaction.call(engine, async (concurrentTx) => {
+                await concurrentTx.addTag(slug, 'concurrent-tag');
+              });
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            return tags;
+          };
+          return fn(tx);
+        }) as Promise<T>;
+      };
+      await expect(op.handler(ctx(), {
+        slug,
+        expected_content_hash: before.content_hash,
+        expected_preimage_markdown_sha256: beforeMarkdownSha256,
+        expected_content_sha256: createHash('sha256').update(content).digest('hex'),
+        expected_postimage_content_hash: canonicalPostimageHash(slug, content),
+        file_path: filePath,
+      })).rejects.toThrow('readback mismatch');
+      await concurrentTagWrite;
+      expect((await engine.getPage(slug))?.title).toBe('Approved');
+      expect(await engine.getTags(slug)).toEqual(['approved-tag', 'concurrent-tag']);
+    } finally {
+      engine.transaction = originalTransaction;
+      await concurrentTagWrite.catch(() => {});
       await rm(dir, { recursive: true, force: true });
     }
   });
@@ -536,7 +651,8 @@ describe('exact corpus page operations', () => {
       }],
       ['put_page_file_exact', {
         slug: 'projects/existing', expected_content_hash: 'a'.repeat(64),
-        expected_content_sha256: 'b'.repeat(64), expected_postimage_content_hash: 'c'.repeat(64),
+        expected_preimage_markdown_sha256: 'b'.repeat(64),
+        expected_content_sha256: 'c'.repeat(64), expected_postimage_content_hash: 'd'.repeat(64),
         file_path: '/tmp/nope',
       }],
       ['soft_delete_page_exact', { slug: 'projects/old', expected_content_hash: 'a'.repeat(64) }],

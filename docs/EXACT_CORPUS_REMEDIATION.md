@@ -17,12 +17,15 @@ through the local `gbrain call` surface with an explicit source selection.
   content hash are read back exactly.
 - `put_page_file_exact` merges an approved private-file draft into one active
   lowercase source/slug. `expected_content_hash` binds the active preimage,
-  `expected_content_sha256` binds the file bytes, and
+  `expected_preimage_markdown_sha256` independently binds its exact rendered
+  Markdown bytes, `expected_content_sha256` binds the file bytes, and
   `expected_postimage_content_hash` binds the canonical parsed postimage. The
-  importer locks and rechecks the preimage inside the write transaction before
-  version, page, tag, alias, or chunk writes. Tag and alias projection is exact
-  and transactional. This operation calls the canonical importer directly with
-  embedding disabled; it does not run ordinary `put_page` repository
+  importer locks and rechecks both active preimage hashes inside the write
+  transaction before version, page, tag, alias, or chunk writes. Tag and alias
+  projection is exact and transactional. All canonical tag add/remove writers
+  take the same page-row lock, so concurrent tag mutations serialize after the
+  exact projection instead of being lost. This operation calls the canonical
+  importer directly with embedding disabled; it does not run ordinary `put_page` repository
   write-through, auto-link, timeline, facts, chronicle, or post-write lint
   hooks, and importer doc-to-code relation extraction is disabled. Readback
   strictly verifies page fields, type, tags, aliases, source, and canonical
