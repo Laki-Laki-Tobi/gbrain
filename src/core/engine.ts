@@ -1174,6 +1174,12 @@ export interface BrainEngine {
    */
   restoreLinkExact(edge: ExactLinkIdentity, opts?: { sourceId?: string }): Promise<void>;
   /**
+   * Local-admin rollback primitive. Removes exactly one persisted edge without
+   * widening across sibling provenance or nullable identity fields. Canonical
+   * implementations lock every endpoint, including soft-deleted rows.
+   */
+  removeLinkExact(edge: ExactLinkIdentity, opts?: { sourceId?: string }): Promise<void>;
+  /**
    * Remove links from `from` to `to`. If linkType is provided, only that specific
    * (from, to, type) row is removed. If omitted, ALL link types between the pair
    * are removed (matches pre-multi-type-link behavior). linkSource additionally

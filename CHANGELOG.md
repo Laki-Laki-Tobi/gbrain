@@ -2,6 +2,17 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.12] - 2026-08-28
+
+### Added
+- `gbrain call --stdin <tool>` accepts bounded JSON parameters over standard
+  input, keeping sensitive exact-operation payloads out of process arguments.
+- `remove_link_exact` removes one fully specified, source-scoped link identity
+  through a local-only admin operation with transactional exact-one and
+  absence checks.
+
+No schema migrations are included in this vendor patch.
+
 ## [0.42.59.11] - 2026-08-28
 
 ### Fixed
