@@ -3440,32 +3440,43 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   // Tags
+  private async withTagWriteTransaction<T>(fn: (engine: PGLiteEngine) => Promise<T>): Promise<T> {
+    if ((this as unknown as Record<PropertyKey, unknown>)[TRANSACTION_SCOPE] === true) return fn(this);
+    return this.transaction((tx) => fn(tx as PGLiteEngine));
+  }
+
+  private async lockTagPage(slug: string, sourceId: string, required: boolean): Promise<number | null> {
+    const { rows } = await this.db.query(
+      'SELECT id FROM pages WHERE slug = $1 AND source_id = $2 FOR UPDATE',
+      [slug, sourceId],
+    );
+    if (rows.length === 0) {
+      if (required) throw new Error(`addTag failed: page "${slug}" (source=${sourceId}) not found`);
+      return null;
+    }
+    return Number((rows[0] as { id: number | string }).id);
+  }
+
   async addTag(slug: string, tag: string, opts?: { sourceId?: string }): Promise<void> {
     const sourceId = opts?.sourceId ?? 'default';
-    // Pre-check source-scoped page existence; ON CONFLICT only handles the
-    // already-tagged case, not missing pages.
-    const page = await this.db.query(
-      'SELECT id FROM pages WHERE slug = $1 AND source_id = $2',
-      [slug, sourceId]
-    );
-    if (page.rows.length === 0) throw new Error(`addTag failed: page "${slug}" (source=${sourceId}) not found`);
-    await this.db.query(
-      `INSERT INTO tags (page_id, tag)
-       VALUES ($1, $2)
-       ON CONFLICT (page_id, tag) DO NOTHING`,
-      [(page.rows[0] as { id: number }).id, tag]
-    );
+    await this.withTagWriteTransaction(async (tx) => {
+      const pageId = await tx.lockTagPage(slug, sourceId, true);
+      await tx.db.query(
+        `INSERT INTO tags (page_id, tag)
+         VALUES ($1, $2)
+         ON CONFLICT (page_id, tag) DO NOTHING`,
+        [pageId, tag],
+      );
+    });
   }
 
   async removeTag(slug: string, tag: string, opts?: { sourceId?: string }): Promise<void> {
     const sourceId = opts?.sourceId ?? 'default';
-    // Source-qualify the page-id subquery; slugs are only unique per source.
-    await this.db.query(
-      `DELETE FROM tags
-       WHERE page_id = (SELECT id FROM pages WHERE slug = $1 AND source_id = $2)
-         AND tag = $3`,
-      [slug, sourceId, tag]
-    );
+    await this.withTagWriteTransaction(async (tx) => {
+      const pageId = await tx.lockTagPage(slug, sourceId, false);
+      if (pageId == null) return;
+      await tx.db.query('DELETE FROM tags WHERE page_id = $1 AND tag = $2', [pageId, tag]);
+    });
   }
 
   async getTags(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<string[]> {

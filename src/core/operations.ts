@@ -1310,6 +1310,7 @@ const put_page_file_exact: Operation = {
   params: {
     slug: { type: 'string', required: true },
     expected_content_hash: { type: 'string', required: true, description: 'Exact active preimage content hash.' },
+    expected_preimage_markdown_sha256: { type: 'string', required: true, description: 'Exact SHA-256 of the active preimage rendered Markdown.' },
     expected_content_sha256: { type: 'string', required: true, description: 'Exact SHA-256 of the private file bytes.' },
     expected_postimage_content_hash: { type: 'string', required: true, description: 'Exact canonical content hash approved for the postimage.' },
     file_path: { type: 'string', required: true },
@@ -1326,10 +1327,12 @@ const put_page_file_exact: Operation = {
     }
     const slug = requireLowercaseExactSlug(p.slug);
     const expectedContentHash = requireExactString(p, 'expected_content_hash');
+    const expectedPreimageMarkdownSha256 = requireExactString(p, 'expected_preimage_markdown_sha256');
     const expectedFileSha256 = requireExactString(p, 'expected_content_sha256');
     const expectedPostimageContentHash = requireExactString(p, 'expected_postimage_content_hash');
     for (const [name, value] of [
       ['expected_content_hash', expectedContentHash],
+      ['expected_preimage_markdown_sha256', expectedPreimageMarkdownSha256],
       ['expected_content_sha256', expectedFileSha256],
       ['expected_postimage_content_hash', expectedPostimageContentHash],
     ] as const) {
@@ -1362,6 +1365,7 @@ const put_page_file_exact: Operation = {
       remote: false,
       exactMerge: {
         expectedPreimageContentHash: expectedContentHash,
+        expectedPreimageMarkdownSha256,
         expectedPostimageContentHash,
       },
     });

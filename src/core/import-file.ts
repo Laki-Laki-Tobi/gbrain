@@ -3,7 +3,7 @@ import { basename, extname } from 'path';
 import { createHash } from 'crypto';
 import { marked } from 'marked';
 import type { BrainEngine, FileSpec } from './engine.ts';
-import { parseMarkdown } from './markdown.ts';
+import { parseMarkdown, serializePageToMarkdown } from './markdown.ts';
 import { chunkText } from './chunkers/recursive.ts';
 import { chunkCodeText, chunkCodeTextFull, detectCodeLanguage, CHUNKER_VERSION } from './chunkers/code.ts';
 import { findChunkForOffset } from './chunkers/edge-extractor.ts';
@@ -290,6 +290,7 @@ export async function importFromContent(
      */
     exactMerge?: {
       expectedPreimageContentHash: string;
+      expectedPreimageMarkdownSha256: string;
       expectedPostimageContentHash: string;
     };
     /**
@@ -787,6 +788,17 @@ export async function importFromContent(
       }
       if (locked[0].content_hash !== opts.exactMerge.expectedPreimageContentHash) {
         throw new Error(`[import] exact merge preimage hash drift for ${sourceId ?? 'default'}/${slug}`);
+      }
+      const lockedPage = await tx.getPage(slug, { sourceId: sourceId ?? 'default', includeDeleted: true });
+      if (!lockedPage || lockedPage.deleted_at) {
+        throw new Error(`[import] exact merge requires one active rendered preimage: ${sourceId ?? 'default'}/${slug}`);
+      }
+      const lockedTags = await tx.getTags(slug, { sourceId: sourceId ?? 'default' });
+      const lockedMarkdownSha256 = createHash('sha256')
+        .update(serializePageToMarkdown(lockedPage, lockedTags))
+        .digest('hex');
+      if (lockedMarkdownSha256 !== opts.exactMerge.expectedPreimageMarkdownSha256) {
+        throw new Error(`[import] exact merge preimage markdown drift for ${sourceId ?? 'default'}/${slug}`);
       }
       preimageCreatedAt = new Date(locked[0].created_at);
       preimageUpdatedAt = new Date(locked[0].updated_at);
