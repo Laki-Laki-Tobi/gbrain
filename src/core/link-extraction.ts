@@ -889,6 +889,7 @@ export function makeResolver(
   opts: { mode: 'batch' | 'live'; sourceId?: string } = { mode: 'live' },
 ): SlugResolver {
   const cache = new Map<string, string | null>();
+  const sourceOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
 
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
 
@@ -946,7 +947,7 @@ export function makeResolver(
       // digit-leading folders and nested paths. A miss still falls through to
       // the existing hint/fuzzy resolution without inventing a target.
       if (/\//.test(trimmed) && /^[a-z0-9][a-z0-9/_-]*$/.test(trimmed)) {
-        const page = await engine.getPage(trimmed);
+        const page = await engine.getPage(trimmed, sourceOpts);
         if (page) {
           cache.set(cacheKey, trimmed);
           return trimmed;
@@ -958,7 +959,7 @@ export function makeResolver(
       for (const hint of hints) {
         if (!hint) continue;
         const candidate = `${hint}/${slugified}`;
-        const page = await engine.getPage(candidate);
+        const page = await engine.getPage(candidate, sourceOpts);
         if (page) {
           cache.set(cacheKey, candidate);
           return candidate;
@@ -970,7 +971,7 @@ export function makeResolver(
       // try the whole pages table.
       const searchHints = hints.length > 0 ? hints : [undefined];
       for (const hint of searchHints) {
-        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55);
+        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55, opts.sourceId);
         if (match) {
           cache.set(cacheKey, match.slug);
           return match.slug;
@@ -982,7 +983,7 @@ export function makeResolver(
       // mode skips this step entirely to keep migration deterministic.
       if (opts.mode === 'live') {
         try {
-          const results = await engine.searchKeyword(trimmed, { limit: 3 });
+          const results = await engine.searchKeyword(trimmed, { limit: 3, sourceId: opts.sourceId });
           if (results.length > 0 && results[0].score >= 0.8) {
             // Filter by dir hint if provided.
             const top = hints.length > 0

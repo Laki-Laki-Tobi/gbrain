@@ -651,6 +651,273 @@ describe('put_page_file_exact', () => {
   });
 });
 
+describe('reindex_page_links_exact', () => {
+  test('repairs a fuzzy same-basename frontmatter edge without rewriting the page or creating a version', async () => {
+    const op = operationsByName.reindex_page_links_exact;
+    expect(op.localOnly).toBe(true);
+    expect(op.scope).toBe('admin');
+    expect(op.mutating).toBe(true);
+
+    const origin = 'memphis/reviews/source';
+    const exactTarget = 'memphis/reports/shared-artifact';
+    const wrongTarget = 'memphis/manifests/shared-artifact';
+    await engine.putPage(exactTarget, {
+      type: 'note', title: 'Report artifact', compiled_truth: 'report', timeline: '', frontmatter: {},
+    });
+    await engine.putPage(wrongTarget, {
+      type: 'note', title: 'Manifest artifact', compiled_truth: 'manifest', timeline: '', frontmatter: {},
+    });
+    await engine.putPage(origin, {
+      type: 'note', title: 'Source', compiled_truth: 'source body', timeline: '',
+      frontmatter: { related: [`[[${exactTarget}]]`] },
+    });
+    await engine.addLink(
+      origin, wrongTarget, `frontmatter.related: [[${exactTarget}]]`, 'related_to',
+      'frontmatter', origin, 'related',
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    const before = (await engine.getPage(origin))!;
+    const beforeMarkdownSha256 = await renderedMarkdownSha256(origin);
+    const beforeCounts = await counts();
+
+    const result = await op.handler(ctx(), {
+      slug: origin,
+      expected_content_hash: before.content_hash,
+      expected_markdown_sha256: beforeMarkdownSha256,
+    }) as any;
+    const after = (await engine.getPage(origin))!;
+    const links = await engine.getLinks(origin, { sourceId: 'default' });
+
+    expect(result).toMatchObject({ status: 'reindexed', slug: origin, content_hash: before.content_hash, created: 1, removed: 1 });
+    expect(after.content_hash).toBe(before.content_hash);
+    expect(after.updated_at.getTime()).toBe(before.updated_at.getTime());
+    expect(await renderedMarkdownSha256(origin)).toBe(beforeMarkdownSha256);
+    expect(await counts()).toEqual(beforeCounts);
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({
+      from_slug: origin,
+      to_slug: exactTarget,
+      link_type: 'related_to',
+      link_source: 'frontmatter',
+      origin_slug: origin,
+      origin_field: 'related',
+      context: `frontmatter.related: [[${exactTarget}]]`,
+    });
+    expect(JSON.stringify(result)).not.toContain('source body');
+  });
+
+  test('fails before mutation on remote, stale preimage, or unresolved frontmatter', async () => {
+    const op = operationsByName.reindex_page_links_exact;
+    const origin = 'projects/reindex-gates';
+    await engine.putPage(origin, {
+      type: 'note', title: 'Gates', compiled_truth: 'unchanged', timeline: '',
+      frontmatter: { related: ['[[missing/nested/page]]'] },
+    });
+    const page = (await engine.getPage(origin))!;
+    const markdownSha256 = await renderedMarkdownSha256(origin);
+    const baseline = await counts();
+    const params = { slug: origin, expected_content_hash: page.content_hash, expected_markdown_sha256: markdownSha256 };
+
+    await expect(op.handler({ ...ctx(), remote: true }, params)).rejects.toThrow('local-only');
+    await expect(op.handler(ctx(), { ...params, expected_content_hash: '0'.repeat(64) })).rejects.toThrow('preimage hash drift');
+    await expect(op.handler(ctx(), { ...params, expected_markdown_sha256: '0'.repeat(64) })).rejects.toThrow('markdown drift');
+    await expect(op.handler(ctx(), params)).rejects.toThrow('unresolved frontmatter');
+    expect(await engine.getLinks(origin, { sourceId: 'default' })).toEqual([]);
+    expect(await counts()).toEqual(baseline);
+  });
+
+  test('resolves fuzzy frontmatter only inside the requested source', async () => {
+    const origin = 'projects/source-scoped-reindex';
+    const localTarget = 'z/local-artifact';
+    const foreignTarget = 'a/foreign-artifact';
+    await engine.putPage(localTarget, {
+      type: 'note', title: 'Shared artifact', compiled_truth: 'local', timeline: '', frontmatter: {},
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
+      ['foreign', 'Foreign test source'],
+    );
+    await engine.putPage(foreignTarget, {
+      type: 'note', title: 'Shared artifact', compiled_truth: 'foreign', timeline: '', frontmatter: {},
+    }, { sourceId: 'foreign' });
+    await engine.putPage(origin, {
+      type: 'note', title: 'Scoped source', compiled_truth: 'body', timeline: '',
+      frontmatter: { related: ['Shared artifact'] },
+    }, { sourceId: 'default' });
+    const page = (await engine.getPage(origin, { sourceId: 'default' }))!;
+
+    await operationsByName.reindex_page_links_exact.handler(ctx(), {
+      slug: origin,
+      expected_content_hash: page.content_hash,
+      expected_markdown_sha256: await renderedMarkdownSha256(origin),
+    });
+
+    const links = await engine.getLinks(origin, { sourceId: 'default' });
+    expect(links.map(link => link.to_slug)).toEqual([localTarget]);
+    expect(links.map(link => link.to_slug)).not.toContain(foreignTarget);
+  });
+
+  test('uses the in-transaction target inventory when a target disappears before the lock', async () => {
+    const origin = 'projects/transactional-target-inventory';
+    const target = 'projects/disappearing-target';
+    await engine.putPage(target, {
+      type: 'note', title: 'Target', compiled_truth: 'target', timeline: '', frontmatter: {},
+    });
+    await engine.putPage(origin, {
+      type: 'note', title: 'Origin', compiled_truth: `[[${target}]]`, timeline: '', frontmatter: {},
+    });
+    await engine.addLink(origin, target, `[[${target}]]`, 'related_to', 'markdown', origin, undefined, {
+      fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default',
+    });
+    const page = (await engine.getPage(origin))!;
+    const params = {
+      slug: origin,
+      expected_content_hash: page.content_hash,
+      expected_markdown_sha256: await renderedMarkdownSha256(origin),
+    };
+    const originalTransaction = engine.transaction.bind(engine);
+    let injected = false;
+    (engine as any).transaction = async (fn: any) => {
+      if (!injected) {
+        injected = true;
+        await engine.softDeletePage(target, { sourceId: 'default' });
+      }
+      return originalTransaction(fn);
+    };
+    try {
+      const result = await operationsByName.reindex_page_links_exact.handler(ctx(), params) as any;
+      expect(result.created).toBe(0);
+    } finally {
+      delete (engine as any).transaction;
+    }
+    expect(await engine.getLinks(origin, { sourceId: 'default' })).toEqual([]);
+  });
+
+  test('rolls back the complete reconciliation when a later link mutation fails', async () => {
+    const origin = 'projects/reindex-rollback';
+    const targets = ['projects/reindex-target-a', 'projects/reindex-target-b'];
+    for (const target of targets) {
+      await engine.putPage(target, {
+        type: 'note', title: target, compiled_truth: target, timeline: '', frontmatter: {},
+      });
+    }
+    await engine.putPage(origin, {
+      type: 'note', title: 'Rollback', compiled_truth: targets.map(target => `[[${target}]]`).join('\n'),
+      timeline: '', frontmatter: {},
+    });
+    const page = (await engine.getPage(origin))!;
+    const originalTransaction = engine.transaction.bind(engine);
+    let addCalls = 0;
+    (engine as any).transaction = async (fn: any) => originalTransaction(async (tx) => {
+      const originalAddLink = tx.addLink.bind(tx);
+      (tx as any).addLink = async (...args: any[]) => {
+        addCalls++;
+        if (addCalls === 2) throw new Error('injected second-link failure');
+        return (originalAddLink as any)(...args);
+      };
+      return fn(tx);
+    });
+    try {
+      await expect(operationsByName.reindex_page_links_exact.handler(ctx(), {
+        slug: origin,
+        expected_content_hash: page.content_hash,
+        expected_markdown_sha256: await renderedMarkdownSha256(origin),
+      })).rejects.toThrow('injected second-link failure');
+    } finally {
+      delete (engine as any).transaction;
+    }
+    expect(addCalls).toBe(2);
+    expect(await engine.getLinks(origin, { sourceId: 'default' })).toEqual([]);
+  });
+
+  test('does not report a false failure for a page mutation committed after reconciliation', async () => {
+    const origin = 'projects/post-commit-concurrency';
+    const target = 'projects/post-commit-target';
+    await engine.putPage(target, {
+      type: 'note', title: 'Target', compiled_truth: 'target', timeline: '', frontmatter: {},
+    });
+    await engine.putPage(origin, {
+      type: 'note', title: 'Before', compiled_truth: `[[${target}]]`, timeline: '', frontmatter: {},
+    });
+    const page = (await engine.getPage(origin))!;
+    const originalTransaction = engine.transaction.bind(engine);
+    (engine as any).transaction = async (fn: any) => {
+      const result = await originalTransaction(fn);
+      await engine.executeRaw(
+        `UPDATE pages SET title = 'Concurrent update' WHERE source_id = $1 AND slug = $2`,
+        ['default', origin],
+      );
+      return result;
+    };
+    try {
+      await expect(operationsByName.reindex_page_links_exact.handler(ctx(), {
+        slug: origin,
+        expected_content_hash: page.content_hash,
+        expected_markdown_sha256: await renderedMarkdownSha256(origin),
+      })).resolves.toMatchObject({ status: 'reindexed', slug: origin });
+    } finally {
+      delete (engine as any).transaction;
+    }
+    expect((await engine.getPage(origin))?.title).toBe('Concurrent update');
+  });
+});
+
+describe('put_page auto-link concurrency', () => {
+  test('an older post-hook cannot overwrite links from a newer page write', async () => {
+    const origin = 'projects/ordinary-auto-link-race';
+    const targetA = 'projects/ordinary-race-target-a';
+    const targetB = 'projects/ordinary-race-target-b';
+    for (const target of [targetA, targetB]) {
+      await engine.putPage(target, {
+        type: 'note', title: target, compiled_truth: target, timeline: '', frontmatter: {},
+      });
+    }
+
+    const originalTransaction = engine.transaction.bind(engine);
+    let transactionCalls = 0;
+    let signalPaused!: () => void;
+    let releasePaused!: () => void;
+    const paused = new Promise<void>((resolve) => { signalPaused = resolve; });
+    const released = new Promise<void>((resolve) => { releasePaused = resolve; });
+    (engine as any).transaction = async (fn: any) => {
+      transactionCalls++;
+      if (transactionCalls === 2) {
+        signalPaused();
+        await released;
+      }
+      return originalTransaction(fn);
+    };
+
+    try {
+      const older = operationsByName.put_page.handler(ctx(), {
+        slug: origin,
+        content: `# Older\n\n[[${targetA}]]`,
+        no_embed: true,
+      }) as Promise<any>;
+      await paused;
+      const newer = await operationsByName.put_page.handler(ctx(), {
+        slug: origin,
+        content: `# Newer\n\n[[${targetB}]]`,
+        no_embed: true,
+      }) as any;
+      releasePaused();
+      const olderResult = await older;
+
+      expect(newer.auto_links).toMatchObject({ created: 1, errors: 0 });
+      expect(olderResult.auto_links.error).toContain('locked preimage drift');
+    } finally {
+      releasePaused();
+      delete (engine as any).transaction;
+    }
+
+    const page = await engine.getPage(origin, { sourceId: 'default' });
+    const links = await engine.getLinks(origin, { sourceId: 'default' });
+    expect(page?.compiled_truth).toContain(targetB);
+    expect(page?.compiled_truth).not.toContain(targetA);
+    expect(links.map(link => link.to_slug)).toEqual([targetB]);
+  });
+});
+
 describe('exact corpus page operations', () => {
   test('reject every remediation operation remotely before touching the engine', async () => {
     const explodingEngine = new Proxy({} as PGLiteEngine, {
@@ -667,6 +934,10 @@ describe('exact corpus page operations', () => {
         expected_preimage_markdown_sha256: 'b'.repeat(64),
         expected_content_sha256: 'c'.repeat(64), expected_postimage_content_hash: 'd'.repeat(64),
         file_path: '/tmp/nope',
+      }],
+      ['reindex_page_links_exact', {
+        slug: 'projects/existing', expected_content_hash: 'a'.repeat(64),
+        expected_markdown_sha256: 'b'.repeat(64),
       }],
       ['soft_delete_page_exact', {
         slug: 'projects/old', expected_content_hash: 'a'.repeat(64),

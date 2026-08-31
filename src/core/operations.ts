@@ -987,7 +987,10 @@ const put_page: Operation = {
       try {
         const enabled = await isAutoLinkEnabled(ctx.engine);
         if (enabled) {
-          autoLinks = await runAutoLink(ctx.engine, slug, result.parsedPage, ctx.sourceId ? { sourceId: ctx.sourceId } : undefined);
+          autoLinks = await runAutoLink(ctx.engine, slug, result.parsedPage, {
+            sourceId: ctx.sourceId ?? 'default',
+            expectedContentHash: computeImportContentHash(result.parsedPage),
+          });
         }
       } catch (e) {
         autoLinks = { error: e instanceof Error ? e.message : String(e) };
@@ -1377,6 +1380,59 @@ const put_page_file_exact: Operation = {
   },
 };
 
+const reindex_page_links_exact: Operation = {
+  name: 'reindex_page_links_exact',
+  description: 'Local-admin exact-preimage-gated link reconciliation without rewriting the page or creating a page version.',
+  params: {
+    slug: { type: 'string', required: true },
+    expected_content_hash: { type: 'string', required: true },
+    expected_markdown_sha256: { type: 'string', required: true },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError('permission_denied', 'reindex_page_links_exact is local-only and must be called through the local CLI.');
+    }
+    const slug = requireLowercaseExactSlug(p.slug);
+    const expectedContentHash = requireExactString(p, 'expected_content_hash');
+    const expectedMarkdownSha256 = requireExactString(p, 'expected_markdown_sha256');
+    for (const [name, value] of [
+      ['expected_content_hash', expectedContentHash],
+      ['expected_markdown_sha256', expectedMarkdownSha256],
+    ] as const) {
+      if (!/^[a-f0-9]{64}$/.test(value)) throw new OperationError('invalid_params', `${name} must be lowercase sha256 hex`);
+    }
+
+    const sourceId = ctx.sourceId || 'default';
+    const page = await ctx.engine.getPage(slug, { sourceId, includeDeleted: true });
+    if (!page || page.deleted_at || page.content_hash !== expectedContentHash) {
+      throw new OperationError('storage_error', `reindex_page_links_exact preimage hash drift for ${slug}`);
+    }
+    const tags = await ctx.engine.getTags(slug, { sourceId });
+    const markdownSha256 = createHash('sha256').update(serializePageToMarkdown(page, tags)).digest('hex');
+    if (markdownSha256 !== expectedMarkdownSha256) {
+      throw new OperationError('storage_error', `reindex_page_links_exact markdown drift for ${slug}`);
+    }
+    if (ctx.dryRun) {
+      return { dry_run: true, action: 'reindex_page_links_exact', slug, content_hash: expectedContentHash };
+    }
+
+    const result = await runAutoLink(ctx.engine, slug, {
+      type: page.type,
+      compiled_truth: page.compiled_truth,
+      timeline: page.timeline || '',
+      frontmatter: page.frontmatter || {},
+    }, {
+      sourceId,
+      strict: true,
+      exactGate: { expectedContentHash, expectedMarkdownSha256 },
+    });
+    return { status: 'reindexed', slug, content_hash: expectedContentHash, created: result.created, removed: result.removed };
+  },
+};
+
 // v0.31.2: isFactsBackstopEligible moved to src/core/facts/eligibility.ts
 // so sync.ts, file_upload, code_import, and runFactsBackstop all share one
 // predicate. Imported above.
@@ -1386,16 +1442,21 @@ const put_page_file_exact: Operation = {
  * Creates new links via addLink, removes stale ones (links present in DB but no
  * longer referenced in content) via removeLink. Returns counts.
  *
- * Runs OUTSIDE importFromContent's transaction so it doesn't block the page write
- * or get rolled back if a single link operation fails. Per-link failures are
- * counted; the overall function never throws (catch in put_page handler covers
- * extraction errors).
+ * Runs OUTSIDE importFromContent's transaction so it doesn't block the page write.
+ * Ordinary put_page reconciliation remains best-effort and counts per-link
+ * failures. Exact governance callers opt into strict mode, which rolls back the
+ * whole reconciliation and propagates any link mutation failure.
  */
 async function runAutoLink(
   engine: BrainEngine,
   slug: string,
   parsed: { type: PageType; compiled_truth: string; timeline: string; frontmatter: Record<string, unknown> },
-  opts?: { sourceId?: string },
+  opts?: {
+    sourceId?: string;
+    strict?: boolean;
+    expectedContentHash?: string;
+    exactGate?: { expectedContentHash: string; expectedMarkdownSha256: string };
+  },
 ): Promise<{ created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[] }> {
   const fullContent = parsed.compiled_truth + '\n' + parsed.timeline;
   // v0.31.8 (codex OV-2): thread sourceId through every read + write inside
@@ -1415,32 +1476,16 @@ async function runAutoLink(
   // Live-mode resolver: per-put throwaway cache, pg_trgm + optional search.
   // Issue #972 (codex [P1]): pass sourceId so basename resolution stays
   // within this page's source — no cross-source basename edges.
-  const resolver = makeResolver(engine, { mode: 'live', sourceId: opts?.sourceId });
+  const resolver = makeResolver(engine, { mode: opts?.strict ? 'batch' : 'live', sourceId: opts?.sourceId });
   // Issue #972: opt-in bare-wikilink basename resolution. Off by default.
   const globalBasename = await isGlobalBasenameEnabled(engine);
   const { candidates, unresolved } = await extractPageLinks(
     slug, fullContent, parsed.frontmatter, parsed.type, resolver,
     { globalBasename },
   );
-
-  // Resolve which targets exist (skip refs to non-existent pages to avoid FK
-  // violation churn in addLink). One getAllSlugs call upfront, O(1) lookup.
-  // v0.31.8 (D12): scoped to the source when opts.sourceId is set so wikilink
-  // resolution doesn't span unrelated sources.
-  const allSlugs = await engine.getAllSlugs(sourceOpts);
-  const valid = candidates.filter(c =>
-    allSlugs.has(c.targetSlug) && (!c.fromSlug || allSlugs.has(c.fromSlug))
-  );
-
-  // Split candidates by direction. Outgoing (fromSlug === slug or unset) are
-  // this page's own edges, reconciled against getLinks(slug). Incoming
-  // (fromSlug !== slug — frontmatter with `direction: incoming`) are edges
-  // where this page is the TO side; reconciled against getBacklinks(slug)
-  // but SCOPED to the frontmatter edges this page authored via
-  // (link_source='frontmatter' AND origin_slug = slug). We never touch
-  // frontmatter edges authored by OTHER pages.
-  const out = valid.filter(c => !c.fromSlug || c.fromSlug === slug);
-  const inc = valid.filter(c => c.fromSlug && c.fromSlug !== slug);
+  if (opts?.strict && unresolved.length > 0) {
+    throw new OperationError('storage_error', `exact link reindex has ${unresolved.length} unresolved frontmatter reference(s)`);
+  }
 
   // Run getLinks + addLink/removeLink loops inside a single transaction so that
   // concurrent put_page calls on the same slug can't race the reconciliation:
@@ -1459,6 +1504,49 @@ async function runAutoLink(
     } catch {
       // engine doesn't support advisory locks — fall through
     }
+    const expectedContentHash = opts?.exactGate?.expectedContentHash ?? opts?.expectedContentHash;
+    if (expectedContentHash) {
+      const locked = await tx.executeRaw<{
+        source_id: string;
+        slug: string;
+        content_hash: string;
+        deleted_at: Date | string | null;
+      }>(`
+        SELECT source_id, slug, content_hash, deleted_at
+          FROM pages
+         WHERE source_id = $1 AND slug = $2
+         FOR UPDATE
+      `, [opts?.sourceId ?? 'default', slug]);
+      if (locked.length !== 1 || locked[0].source_id !== (opts?.sourceId ?? 'default')
+        || locked[0].slug !== slug || locked[0].deleted_at !== null
+        || locked[0].content_hash !== expectedContentHash) {
+        throw new OperationError('storage_error', `auto-link locked preimage drift for ${slug}`);
+      }
+      if (opts?.exactGate) {
+        const lockedPage = await tx.getPage(slug, { sourceId: opts.sourceId ?? 'default', includeDeleted: true });
+        const lockedTags = await tx.getTags(slug, { sourceId: opts.sourceId ?? 'default' });
+        const lockedMarkdownSha256 = lockedPage
+          ? createHash('sha256').update(serializePageToMarkdown(lockedPage, lockedTags)).digest('hex')
+          : null;
+        if (!lockedPage || lockedPage.deleted_at || lockedMarkdownSha256 !== opts.exactGate.expectedMarkdownSha256) {
+          throw new OperationError('storage_error', `exact link reindex locked markdown drift for ${slug}`);
+        }
+      }
+    }
+    // Resolve target existence from the same transactional snapshot used for
+    // writes. A pre-transaction slug snapshot can go stale and silently omit a
+    // newly-created target or retain a deleted one.
+    const allSlugs = await tx.getAllSlugs(sourceOpts);
+    const valid = candidates.filter(c =>
+      allSlugs.has(c.targetSlug) && (!c.fromSlug || allSlugs.has(c.fromSlug))
+    );
+
+    // Outgoing candidates are this page's own edges. Incoming frontmatter
+    // candidates are scoped by origin_slug below so another page's authored
+    // relations are never reconciled away.
+    const out = valid.filter(c => !c.fromSlug || c.fromSlug === slug);
+    const inc = valid.filter(c => c.fromSlug && c.fromSlug !== slug);
+
     const existingOut = await tx.getLinks(slug, sourceOpts);
     // Incoming: we only look at frontmatter edges WE authored (origin_slug=slug).
     // Non-frontmatter and other-page frontmatter edges survive untouched.
@@ -1503,7 +1591,8 @@ async function runAutoLink(
           `${l.to_slug}\u0000${l.link_type}\u0000${l.link_source ?? 'markdown'}` === existKey
         );
         if (!exists) created++;
-      } catch {
+      } catch (error) {
+        if (opts?.strict) throw error;
         errors++;
       }
     }
@@ -1521,7 +1610,8 @@ async function runAutoLink(
           `${l.from_slug}\u0000${l.link_type}` === existKey
         );
         if (!exists) created++;
-      } catch {
+      } catch (error) {
+        if (opts?.strict) throw error;
         errors++;
       }
     }
@@ -1533,7 +1623,8 @@ async function runAutoLink(
         try {
           await tx.removeLink(slug, l.to_slug, l.link_type, l.link_source ?? undefined, removeSourceOpts);
           removed++;
-        } catch {
+        } catch (error) {
+          if (opts?.strict) throw error;
           errors++;
         }
       }
@@ -1546,7 +1637,8 @@ async function runAutoLink(
         try {
           await tx.removeLink(l.from_slug, slug, l.link_type, 'frontmatter', removeSourceOpts);
           removed++;
-        } catch {
+        } catch (error) {
+          if (opts?.strict) throw error;
           errors++;
         }
       }
@@ -6293,7 +6385,7 @@ const chronicle_backfill: Operation = {
 
 export const operations: Operation[] = [
   // Page CRUD
-  get_page, put_page, create_page_file_exact, put_page_file_exact, patch_page_metadata_exact,
+  get_page, put_page, create_page_file_exact, put_page_file_exact, reindex_page_links_exact, patch_page_metadata_exact,
   soft_delete_page_exact, delete_page, list_pages,
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)
   restore_page_exact, restore_page, purge_pages_exact, inventory_deleted_pages_exact, purge_deleted_pages,
