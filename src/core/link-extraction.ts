@@ -48,12 +48,11 @@ export interface EntityRef {
    */
   sourceId?: string | null;
   /**
-   * Issue #972: set when the ref came from the generic `[[bare-name]]`
-   * pass (not gated by DIR_PATTERN). The `slug` field holds the literal
-   * wikilink text — callers MUST run it through a SlugResolver's
-   * `resolveBasenameMatches` (gated by `link_resolution.global_basename`)
-   * before persisting. Untagged refs already match a known entity dir
-   * (people/, companies/, etc.) and need no resolution.
+   * Issue #972: set when the ref came from the generic wikilink pass (not
+   * gated by DIR_PATTERN). Slash-qualified refs are literal slug candidates;
+   * bare names require a SlugResolver's `resolveBasenameMatches` (gated by
+   * `link_resolution.global_basename`) before persisting. Untagged refs
+   * already match a known entity dir (people/, companies/, etc.).
    *
    * One ref tagged `needsResolution: true` may resolve to MULTIPLE target
    * slugs when multiple pages share the basename. The caller emits one
@@ -482,6 +481,21 @@ export async function extractPageLinks(
     // pre-v0.40.8.2 behavior of dropping bare wikilinks outside
     // DIR_PATTERN.
     if (ref.needsResolution) {
+      // A slash-qualified wikilink outside DIR_PATTERN is an unambiguous
+      // literal slug candidate. Downstream source-scoped existence checks
+      // drop it when no target page exists, matching the established path
+      // for whitelisted directories without expanding that entity allowlist.
+      if (ref.slug.includes('/') && ref.slug !== slug) {
+        const idx = content.indexOf(ref.slug);
+        const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
+        candidates.push({
+          targetSlug: ref.slug,
+          linkType: inferLinkType(pageType, context, content, ref.slug),
+          context,
+          linkSource: 'markdown',
+        });
+        continue;
+      }
       if (!opts.globalBasename || typeof resolver.resolveBasenameMatches !== 'function') {
         continue;
       }
