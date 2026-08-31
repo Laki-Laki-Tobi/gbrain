@@ -1256,6 +1256,7 @@ export interface BrainEngine {
     name: string,
     dirPrefix?: string,
     minSimilarity?: number,
+    sourceId?: string,
   ): Promise<{ slug: string; similarity: number } | null>;
   /**
    * v0.34.1 (#861 — P0 leak seal): `opts.sourceId` / `opts.sourceIds`

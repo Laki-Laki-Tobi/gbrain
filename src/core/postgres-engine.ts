@@ -3009,6 +3009,7 @@ export class PostgresEngine implements BrainEngine {
     name: string,
     dirPrefix?: string,
     minSimilarity: number = 0.55,
+    sourceId?: string,
   ): Promise<{ slug: string; similarity: number } | null> {
     const sql = this.sql;
     // Use the `similarity()` function directly with an explicit threshold
@@ -3022,15 +3023,26 @@ export class PostgresEngine implements BrainEngine {
     // same winner when multiple pages score equally (prevents churn
     // in put_page auto-link reconciliation).
     const prefixPattern = dirPrefix ? `${dirPrefix}/%` : '%';
-    const rows = await sql`
-      SELECT slug, similarity(title, ${name}) AS sim
-      FROM pages
-      WHERE similarity(title, ${name}) >= ${minSimilarity}
-        AND slug LIKE ${prefixPattern}
-        AND deleted_at IS NULL
-      ORDER BY sim DESC, slug ASC
-      LIMIT 1
-    `;
+    const rows = sourceId
+      ? await sql`
+          SELECT slug, similarity(title, ${name}) AS sim
+          FROM pages
+          WHERE similarity(title, ${name}) >= ${minSimilarity}
+            AND slug LIKE ${prefixPattern}
+            AND source_id = ${sourceId}
+            AND deleted_at IS NULL
+          ORDER BY sim DESC, slug ASC
+          LIMIT 1
+        `
+      : await sql`
+          SELECT slug, similarity(title, ${name}) AS sim
+          FROM pages
+          WHERE similarity(title, ${name}) >= ${minSimilarity}
+            AND slug LIKE ${prefixPattern}
+            AND deleted_at IS NULL
+          ORDER BY sim DESC, slug ASC
+          LIMIT 1
+        `;
     if (rows.length === 0) return null;
     const row = rows[0] as { slug: string; sim: number };
     return { slug: row.slug, similarity: row.sim };

@@ -1024,6 +1024,37 @@ describe('makeResolver — fallback chain', () => {
     expect(await r.resolve('Nonexistent Person', 'people')).toBeNull();
   });
 
+  test('sourceId scopes exact, hinted, fuzzy, and live keyword lookups', async () => {
+    const calls: Array<{ method: string; sourceId?: string }> = [];
+    const engine = {
+      async getPage(slug: string, opts?: { sourceId?: string }) {
+        calls.push({ method: `get:${slug}`, sourceId: opts?.sourceId });
+        if (opts?.sourceId !== 'src-a') return null;
+        if (slug === 'projects/exact' || slug === 'companies/hinted') return { slug } as any;
+        return null;
+      },
+      async findByTitleFuzzy(name: string, _hint?: string, _threshold?: number, sourceId?: string) {
+        calls.push({ method: `fuzzy:${name}`, sourceId });
+        return name === 'Fuzzy title' && sourceId === 'src-a'
+          ? { slug: 'projects/fuzzy', similarity: 0.9 }
+          : null;
+      },
+      async searchKeyword(name: string, opts?: { sourceId?: string }) {
+        calls.push({ method: `search:${name}`, sourceId: opts?.sourceId });
+        return opts?.sourceId === 'src-a'
+          ? [{ slug: 'projects/keyword', score: 0.9 }]
+          : [];
+      },
+    } as unknown as BrainEngine;
+    const r = makeResolver(engine, { mode: 'live', sourceId: 'src-a' });
+
+    expect(await r.resolve('projects/exact')).toBe('projects/exact');
+    expect(await r.resolve('Hinted', 'companies')).toBe('companies/hinted');
+    expect(await r.resolve('Fuzzy title')).toBe('projects/fuzzy');
+    expect(await r.resolve('Keyword title')).toBe('projects/keyword');
+    expect(calls).not.toContainEqual(expect.objectContaining({ sourceId: undefined }));
+  });
+
   // ─── issue #972: resolveBasenameMatches ───────────────────────────────
 
   // Extended fake engine that also implements `getAllSlugs` so
