@@ -942,8 +942,10 @@ export function makeResolver(
 
       const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
 
-      // Step 1: already a slug? (dir/name shape, lowercase, hyphenated)
-      if (/^[a-z][a-z0-9-]*\/[a-z0-9][a-z0-9-]*$/.test(trimmed)) {
+      // Step 1: exact lookup for any lowercase slug-shaped path, including
+      // digit-leading folders and nested paths. A miss still falls through to
+      // the existing hint/fuzzy resolution without inventing a target.
+      if (/\//.test(trimmed) && /^[a-z0-9][a-z0-9/_-]*$/.test(trimmed)) {
         const page = await engine.getPage(trimmed);
         if (page) {
           cache.set(cacheKey, trimmed);
@@ -1003,6 +1005,13 @@ export function makeResolver(
 
 // ─── Frontmatter extractor ──────────────────────────────────────
 
+/** Return the exact target from a wholly wrapped Obsidian wikilink value. */
+export function unwrapWikilink(value: string): string {
+  const match = /^\s*\[\[(.+?)\]\]\s*$/.exec(value);
+  if (!match) return value;
+  return match[1].split('|')[0].split('#')[0].split('^')[0].trim();
+}
+
 export interface UnresolvedFrontmatterRef {
   /** The frontmatter field name. */
   field: string;
@@ -1060,7 +1069,7 @@ export async function extractFrontmatterLinks(
         }
         if (!name) continue;   // skip numbers, nulls, malformed objects
 
-        const resolved = await resolver.resolve(name, mapping.dirHint);
+        const resolved = await resolver.resolve(unwrapWikilink(name), mapping.dirHint);
         if (!resolved) {
           unresolved.push({ field, name });
           continue;
