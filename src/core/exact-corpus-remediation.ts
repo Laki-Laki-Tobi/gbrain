@@ -4,6 +4,8 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import type { BrainEngine } from './engine.ts';
+import { serializePageToMarkdown } from './markdown.ts';
+import type { Page } from './types.ts';
 
 const POLICY_VERSION = 'gbrain-exact-corpus-remediation-v3-2026-08-28';
 const BACKUP_SCHEMA = 'gbrain-purge-pages-exact-backup-v3';
@@ -38,6 +40,16 @@ export interface InventoryDeletedPagesExactArgs {
   minAgeHours: number;
 }
 
+export interface SoftDeleteCandidateExactEntry {
+  slug: string;
+  expectedRawMarkdownSha256: string;
+}
+
+export interface InventorySoftDeleteCandidatesExactArgs {
+  sourceId: string;
+  entries: SoftDeleteCandidateExactEntry[];
+}
+
 interface DeletedPageInventoryDbRow {
   slug: string;
   state: 'deleted' | 'missing' | 'restored';
@@ -45,6 +57,30 @@ interface DeletedPageInventoryDbRow {
   content_hash: string | null;
   active_inbound_count: number | string;
   age_eligible: boolean | null;
+}
+
+interface SoftDeleteCandidateInventoryDbRow {
+  requested_slug: string;
+  expected_raw_markdown_sha256: string;
+  id: number | null;
+  slug: string | null;
+  type: Page['type'] | null;
+  title: string | null;
+  compiled_truth: string | null;
+  timeline: string | null;
+  frontmatter: Record<string, unknown> | null;
+  content_hash: string | null;
+  emotional_weight: number | null;
+  created_at: Date | string | null;
+  updated_at: Date | string | null;
+  deleted_at: Date | string | null;
+  effective_date: Date | string | null;
+  effective_date_source: Page['effective_date_source'] | null;
+  import_filename: string | null;
+  salience_touched_at: Date | string | null;
+  source_id: string | null;
+  tags: string[] | null;
+  inbound_count: number | string;
 }
 
 type JsonRow = Record<string, unknown>;
@@ -229,6 +265,138 @@ export async function inventoryDeletedPagesExact(
       min_age_hours: args.minAgeHours,
       rows: inventory,
     }),
+  };
+}
+
+/** Read-only exact-preimage inventory for a reviewed soft-delete allowlist.
+ * The operation computes canonical Markdown hashes in-process but never returns
+ * page bodies. Inbound counts intentionally match get_backlinks with
+ * include_deleted=true: any persisted edge blocks deletion. */
+export async function inventorySoftDeleteCandidatesExact(
+  engine: BrainEngine,
+  args: InventorySoftDeleteCandidatesExactArgs,
+): Promise<Record<string, unknown>> {
+  const rows = await engine.executeRaw<SoftDeleteCandidateInventoryDbRow>(
+    `WITH requested AS (
+       SELECT slug, expected_raw_markdown_sha256
+         FROM jsonb_to_recordset($2::text::jsonb)
+           AS entry(slug text, expected_raw_markdown_sha256 text)
+     )
+     SELECT r.slug AS requested_slug,
+            r.expected_raw_markdown_sha256,
+            p.id,
+            p.slug,
+            p.type,
+            p.title,
+            p.compiled_truth,
+            p.timeline,
+            p.frontmatter,
+            p.content_hash,
+            p.emotional_weight,
+            p.created_at,
+            p.updated_at,
+            p.deleted_at,
+            p.effective_date,
+            p.effective_date_source,
+            p.import_filename,
+            p.salience_touched_at,
+            p.source_id,
+            CASE WHEN p.id IS NULL THEN ARRAY[]::text[] ELSE COALESCE((
+              SELECT array_agg(t.tag ORDER BY t.tag)
+                FROM tags t
+               WHERE t.page_id = p.id
+            ), ARRAY[]::text[]) END AS tags,
+            CASE WHEN p.id IS NULL THEN 0 ELSE COALESCE((
+              SELECT count(*)::int
+                FROM links l
+                LEFT JOIN pages o ON o.id = l.origin_page_id
+               WHERE l.to_page_id = p.id
+                 AND (l.origin_page_id IS NULL OR o.id IS NOT NULL)
+            ), 0)::int END AS inbound_count
+       FROM requested r
+       LEFT JOIN pages p ON p.source_id = $1 AND p.slug = r.slug
+      ORDER BY r.slug`,
+    [args.sourceId, JSON.stringify(args.entries.map((entry) => ({
+      slug: entry.slug,
+      expected_raw_markdown_sha256: entry.expectedRawMarkdownSha256,
+    })))],
+  );
+
+  const inventory = rows.map((row) => {
+    const inboundCount = Number(row.inbound_count);
+    if (!Number.isInteger(inboundCount) || inboundCount < 0) {
+      throw new Error(`inventory inbound count is invalid for ${row.requested_slug}`);
+    }
+    if (row.id === null) {
+      return {
+        slug: row.requested_slug,
+        expected_raw_markdown_sha256: row.expected_raw_markdown_sha256,
+        state: 'missing',
+        content_hash: null,
+        observed_raw_markdown_sha256: null,
+        inbound_count: 0,
+        status: 'blocked',
+        reasons: ['PAGE_MISSING'],
+      };
+    }
+    if (row.deleted_at !== null) {
+      return {
+        slug: row.requested_slug,
+        expected_raw_markdown_sha256: row.expected_raw_markdown_sha256,
+        state: 'soft_deleted',
+        content_hash: row.content_hash,
+        observed_raw_markdown_sha256: null,
+        inbound_count: inboundCount,
+        status: 'blocked',
+        reasons: ['PAGE_SOFT_DELETED'],
+      };
+    }
+    const page = {
+      ...row,
+      id: Number(row.id),
+      slug: row.slug!,
+      type: row.type!,
+      title: row.title ?? '',
+      compiled_truth: row.compiled_truth ?? '',
+      timeline: row.timeline ?? '',
+      frontmatter: row.frontmatter ?? {},
+      created_at: new Date(row.created_at!),
+      updated_at: new Date(row.updated_at!),
+      deleted_at: null,
+      source_id: row.source_id!,
+    } as Page;
+    const observedRawMarkdownSha256 = sha256(serializePageToMarkdown(page, row.tags ?? []));
+    const reasons: string[] = [];
+    if (observedRawMarkdownSha256 !== row.expected_raw_markdown_sha256) {
+      reasons.push('RAW_MARKDOWN_SHA_DRIFT');
+    }
+    if (inboundCount > 0) reasons.push('LIVE_INBOUND_LINKS');
+    reasons.sort((left, right) => left.localeCompare(right));
+    return {
+      slug: row.requested_slug,
+      expected_raw_markdown_sha256: row.expected_raw_markdown_sha256,
+      state: 'active',
+      content_hash: row.content_hash,
+      observed_raw_markdown_sha256: observedRawMarkdownSha256,
+      inbound_count: inboundCount,
+      status: reasons.length === 0 ? 'eligible' : 'blocked',
+      reasons,
+    };
+  });
+
+  return {
+    source_id: args.sourceId,
+    rows: inventory,
+    counts: {
+      requested: args.entries.length,
+      eligible: inventory.filter((row) => row.status === 'eligible').length,
+      blocked: inventory.filter((row) => row.status === 'blocked').length,
+      missing: inventory.filter((row) => row.state === 'missing').length,
+      soft_deleted: inventory.filter((row) => row.state === 'soft_deleted').length,
+      raw_markdown_sha_drift: inventory.filter((row) => row.reasons.includes('RAW_MARKDOWN_SHA_DRIFT')).length,
+      live_inbound_links: inventory.filter((row) => row.reasons.includes('LIVE_INBOUND_LINKS')).length,
+    },
+    fingerprint: fingerprint({ source_id: args.sourceId, rows: inventory }),
   };
 }
 
