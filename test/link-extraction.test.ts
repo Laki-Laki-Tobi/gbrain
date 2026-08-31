@@ -9,6 +9,7 @@ import {
   parseTimelineEntries,
   isAutoLinkEnabled,
   FRONTMATTER_LINK_MAP,
+  unwrapWikilink,
   type SlugResolver,
 } from '../src/core/link-extraction.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -1265,3 +1266,54 @@ describe("v0.18.0 migration v22 — links_resolution_type", () => {
   });
 });
 
+describe('frontmatter exact slug-path resolution', () => {
+  function fakeEngine(
+    slugs: string[],
+    fuzzyMap: Map<string, { slug: string; similarity: number }> = new Map(),
+  ): BrainEngine {
+    const lookup = new Set(slugs);
+    return {
+      async getPage(slug: string) { return lookup.has(slug) ? { slug } as any : null; },
+      async findByTitleFuzzy(name: string) { return fuzzyMap.get(name) ?? null; },
+      async searchKeyword() { return []; },
+    } as unknown as BrainEngine;
+  }
+
+  test('unwraps aliases, headings, and nested wikilink targets', () => {
+    expect(unwrapWikilink(' [[memphis/reports/artifact|Report]] ')).toBe('memphis/reports/artifact');
+    expect(unwrapWikilink('[[memphis/reports/artifact#Evidence]]')).toBe('memphis/reports/artifact');
+    expect(unwrapWikilink('[[memphis/reports/artifact^row-1]]')).toBe('memphis/reports/artifact');
+    expect(unwrapWikilink('memphis/reports/artifact')).toBe('memphis/reports/artifact');
+    expect(unwrapWikilink('see [[memphis/reports/artifact]]')).toBe('see [[memphis/reports/artifact]]');
+  });
+
+  test('nested exact slug wins over a same-basename fuzzy target', async () => {
+    const resolver = makeResolver(fakeEngine(
+      ['memphis/reports/shared-artifact', 'memphis/manifests/shared-artifact'],
+      new Map([['memphis/reports/shared-artifact', { slug: 'memphis/manifests/shared-artifact', similarity: 1 }]]),
+    ));
+    expect(await resolver.resolve('memphis/reports/shared-artifact')).toBe('memphis/reports/shared-artifact');
+  });
+
+  test('wikilink frontmatter resolves to its exact nested page, not the same-basename decoy', async () => {
+    const resolver = makeResolver(fakeEngine(
+      ['memphis/reports/shared-artifact', 'memphis/manifests/shared-artifact'],
+      new Map([['memphis/reports/shared-artifact', { slug: 'memphis/manifests/shared-artifact', similarity: 1 }]]),
+    ));
+    const result = await extractFrontmatterLinks(
+      'memphis/reviews/source',
+      'concept',
+      { related: ['[[memphis/reports/shared-artifact]]'] },
+      resolver,
+    );
+    expect(result.unresolved).toEqual([]);
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0].targetSlug).toBe('memphis/reports/shared-artifact');
+    expect(result.candidates[0].context).toBe('frontmatter.related: [[memphis/reports/shared-artifact]]');
+  });
+
+  test('missing nested slug falls through without fabricating an exact result', async () => {
+    const resolver = makeResolver(fakeEngine(['memphis/reports/known']));
+    expect(await resolver.resolve('memphis/reports/missing')).toBeNull();
+  });
+});
