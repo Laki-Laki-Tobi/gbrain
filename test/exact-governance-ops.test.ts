@@ -7,7 +7,10 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { computeImportContentHash } from '../src/core/import-file.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../src/core/markdown.ts';
 import { operationsByName, type OperationContext } from '../src/core/operations.ts';
-import { inventoryDeletedPagesExact } from '../src/core/exact-corpus-remediation.ts';
+import {
+  inventoryDeletedPagesExact,
+  inventorySoftDeleteCandidatesExact,
+} from '../src/core/exact-corpus-remediation.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
@@ -1818,5 +1821,140 @@ describe('inventory_deleted_pages_exact', () => {
     expect(second.rows.map((row: any) => row.slug)).toEqual(['archive/inventory-page-c']);
     expect(second.next_cursor).toBeNull();
     expect(typeof first.fingerprint).toBe('string');
+  });
+});
+
+describe('inventory_soft_delete_candidates_exact', () => {
+  test('is local-only, admin-scoped, and read-only', async () => {
+    const op = operationsByName.inventory_soft_delete_candidates_exact;
+    expect(op.localOnly).toBe(true);
+    expect(op.scope).toBe('admin');
+    expect(op.mutating).toBe(false);
+    const explodingEngine = new Proxy({} as PGLiteEngine, { get() { throw new Error('engine must not be touched'); } });
+    await expect(op.handler({ ...ctx(), engine: explodingEngine, remote: true }, {
+      entries: [{ slug: 'archive/reviewed', expected_raw_markdown_sha256: 'a'.repeat(64) }],
+    })).rejects.toThrow('local-only');
+  });
+
+  test('audits every reviewed row without content leakage and matches strict inbound semantics', async () => {
+    const op = operationsByName.inventory_soft_delete_candidates_exact;
+    for (const [slug, body] of [
+      ['archive/live-eligible', 'eligible private body'],
+      ['archive/live-drift', 'drift private body'],
+      ['archive/live-inbound', 'inbound private body'],
+    ]) {
+      await engine.putPage(slug, {
+        type: 'note', title: slug, compiled_truth: body, timeline: '', frontmatter: {},
+      });
+    }
+    const deleted = await seedDeletedInventoryPage('archive/live-deleted', 'deleted private body', 100);
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+      ['inventory-other'],
+    );
+    await engine.putPage('archive/live-eligible', {
+      type: 'note', title: 'Foreign duplicate', compiled_truth: 'foreign private body', timeline: '', frontmatter: {},
+    }, { sourceId: 'inventory-other' });
+    await engine.putPage('projects/foreign-live-referrer', {
+      type: 'note', title: 'Foreign referrer', compiled_truth: 'foreign active referrer', timeline: '', frontmatter: {},
+    }, { sourceId: 'inventory-other' });
+    await engine.putPage('projects/deleted-live-referrer', {
+      type: 'note', title: 'Deleted referrer', compiled_truth: 'deleted referrer body', timeline: '', frontmatter: {},
+    });
+    await engine.putPage('projects/deleted-link-origin', {
+      type: 'note', title: 'Deleted origin', compiled_truth: 'deleted origin body', timeline: '', frontmatter: {},
+    });
+    const inbound = (await engine.getPage('archive/live-inbound'))!;
+    const foreignReferrer = (await engine.getPage('projects/foreign-live-referrer', { sourceId: 'inventory-other' }))!;
+    const deletedReferrer = (await engine.getPage('projects/deleted-live-referrer'))!;
+    const deletedOrigin = (await engine.getPage('projects/deleted-link-origin'))!;
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+       VALUES ($1::int, $2::int, 'related', 'foreign dependency', 'manual')`,
+      [foreignReferrer.id, inbound.id],
+    );
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
+       VALUES ($1::int, $2::int, 'related', 'deleted dependency', 'manual', $3::int, 'related')`,
+      [deletedReferrer.id, inbound.id, deletedOrigin.id],
+    );
+    await engine.executeRaw(
+      `UPDATE pages SET deleted_at = now()
+        WHERE id = ANY($1::int[])`,
+      [[foreignReferrer.id, deletedReferrer.id, deletedOrigin.id]],
+    );
+
+    const eligibleSha = await renderedMarkdownSha256('archive/live-eligible');
+    const inboundSha = await renderedMarkdownSha256('archive/live-inbound');
+    const result = await op.handler(ctx(), { entries: [
+      { slug: 'archive/live-missing', expected_raw_markdown_sha256: 'd'.repeat(64) },
+      { slug: 'archive/live-inbound', expected_raw_markdown_sha256: inboundSha },
+      { slug: 'archive/live-eligible', expected_raw_markdown_sha256: eligibleSha },
+      { slug: 'archive/live-drift', expected_raw_markdown_sha256: 'c'.repeat(64) },
+      { slug: 'archive/live-deleted', expected_raw_markdown_sha256: 'b'.repeat(64) },
+    ] }) as any;
+
+    expect(result.rows.map((row: any) => row.slug)).toEqual([
+      'archive/live-deleted', 'archive/live-drift', 'archive/live-eligible',
+      'archive/live-inbound', 'archive/live-missing',
+    ]);
+    expect(result.rows.find((row: any) => row.slug === 'archive/live-eligible')).toMatchObject({
+      status: 'eligible', state: 'active', inbound_count: 0,
+      expected_raw_markdown_sha256: eligibleSha, observed_raw_markdown_sha256: eligibleSha,
+    });
+    expect(result.rows.find((row: any) => row.slug === 'archive/live-drift')).toMatchObject({
+      status: 'blocked', state: 'active', reasons: ['RAW_MARKDOWN_SHA_DRIFT'],
+    });
+    expect(result.rows.find((row: any) => row.slug === 'archive/live-inbound')).toMatchObject({
+      status: 'blocked', state: 'active', inbound_count: 2, reasons: ['LIVE_INBOUND_LINKS'],
+    });
+    expect((await engine.getBacklinks('archive/live-inbound', {
+      sourceId: 'default', includeDeleted: true,
+    })).length).toBe(2);
+    expect(result.rows.find((row: any) => row.slug === deleted.slug)).toMatchObject({
+      status: 'blocked', state: 'soft_deleted', observed_raw_markdown_sha256: null,
+      reasons: ['PAGE_SOFT_DELETED'],
+    });
+    expect(result.rows.find((row: any) => row.slug === 'archive/live-missing')).toMatchObject({
+      status: 'blocked', state: 'missing', content_hash: null, reasons: ['PAGE_MISSING'],
+    });
+    expect(result.counts).toEqual({
+      requested: 5, eligible: 1, blocked: 4, missing: 1, soft_deleted: 1,
+      raw_markdown_sha_drift: 1, live_inbound_links: 1,
+    });
+    const encoded = JSON.stringify(result);
+    for (const secretBody of [
+      'eligible private body', 'drift private body', 'inbound private body',
+      'deleted private body', 'foreign private body', 'foreign active referrer',
+      'deleted referrer body', 'deleted origin body',
+    ]) expect(encoded).not.toContain(secretBody);
+  });
+
+  test('validates exact reviewed input and fails closed on invalid inventory counts', async () => {
+    const op = operationsByName.inventory_soft_delete_candidates_exact;
+    await expect(op.handler(ctx(), { entries: [] })).rejects.toThrow('between 1 and 500');
+    await expect(op.handler(ctx(), { entries: [
+      { slug: 'Archive/Upper', expected_raw_markdown_sha256: 'a'.repeat(64) },
+    ] })).rejects.toThrow('lowercase');
+    await expect(op.handler(ctx(), { entries: [
+      { slug: 'archive/a', expected_raw_markdown_sha256: 'bad' },
+    ] })).rejects.toThrow('lowercase sha256');
+    await expect(op.handler(ctx(), { entries: [
+      { slug: 'archive/a', expected_raw_markdown_sha256: 'a'.repeat(64) },
+      { slug: 'archive/a', expected_raw_markdown_sha256: 'b'.repeat(64) },
+    ] })).rejects.toThrow('duplicate');
+    await expect(op.handler(ctx(), { entries: [
+      { slug: 'archive/a', expected_raw_markdown_sha256: 'a'.repeat(64), body: 'must not be accepted' },
+    ] })).rejects.toThrow('unknown fields');
+
+    await expect(inventorySoftDeleteCandidatesExact({
+      executeRaw: async () => [{
+        requested_slug: 'archive/invalid-count', expected_raw_markdown_sha256: 'a'.repeat(64),
+        id: null, inbound_count: 'NaN',
+      }],
+    } as any, {
+      sourceId: 'default',
+      entries: [{ slug: 'archive/invalid-count', expectedRawMarkdownSha256: 'a'.repeat(64) }],
+    })).rejects.toThrow('inventory inbound count is invalid');
   });
 });

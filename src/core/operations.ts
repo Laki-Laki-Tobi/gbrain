@@ -39,7 +39,12 @@ import { CJK_SLUG_CHARS } from './cjk.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
 import { runPageVersionRetention } from './page-version-retention.ts';
-import { inventoryDeletedPagesExact, runPurgePagesExact, type PurgeAllowlistEntry } from './exact-corpus-remediation.ts';
+import {
+  inventoryDeletedPagesExact,
+  inventorySoftDeleteCandidatesExact,
+  runPurgePagesExact,
+  type PurgeAllowlistEntry,
+} from './exact-corpus-remediation.ts';
 import {
   GET_RECENT_SALIENCE_DESCRIPTION,
   FIND_ANOMALIES_DESCRIPTION,
@@ -3081,6 +3086,52 @@ const inventory_deleted_pages_exact: Operation = {
     }
   },
   cliHints: { name: 'inventory-deleted-pages-exact' },
+};
+
+const inventory_soft_delete_candidates_exact: Operation = {
+  name: 'inventory_soft_delete_candidates_exact',
+  description: 'Local-admin read-only live eligibility inventory for exact soft-delete candidates.',
+  params: {
+    entries: { type: 'array', required: true, items: { type: 'object' } },
+  },
+  mutating: false,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError('permission_denied', 'inventory_soft_delete_candidates_exact is local-only and must be called through the local CLI.');
+    }
+    if (!Array.isArray(p.entries) || p.entries.length < 1 || p.entries.length > 500) {
+      throw new OperationError('invalid_params', 'entries must contain between 1 and 500 exact candidates');
+    }
+    const entries = p.entries.map((raw, index) => {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new OperationError('invalid_params', `entries[${index}] must be an object`);
+      }
+      const entry = raw as Record<string, unknown>;
+      if (Object.keys(entry).some((key) => !['slug', 'expected_raw_markdown_sha256'].includes(key))) {
+        throw new OperationError('invalid_params', `entries[${index}] has unknown fields`);
+      }
+      const slug = requireLowercaseExactSlug(entry.slug);
+      const expectedRawMarkdownSha256 = entry.expected_raw_markdown_sha256;
+      if (typeof expectedRawMarkdownSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(expectedRawMarkdownSha256)) {
+        throw new OperationError('invalid_params', `entries[${index}].expected_raw_markdown_sha256 must be lowercase sha256 hex`);
+      }
+      return { slug, expectedRawMarkdownSha256 };
+    }).sort((left, right) => left.slug.localeCompare(right.slug));
+    if (new Set(entries.map((entry) => entry.slug)).size !== entries.length) {
+      throw new OperationError('invalid_params', 'entries must not contain duplicate slugs');
+    }
+    try {
+      return await inventorySoftDeleteCandidatesExact(ctx.engine, {
+        sourceId: ctx.sourceId || 'default',
+        entries,
+      });
+    } catch (error) {
+      throw new OperationError('storage_error', error instanceof Error ? error.message : String(error));
+    }
+  },
+  cliHints: { name: 'inventory-soft-delete-candidates-exact' },
 };
 
 const get_links: Operation = {
@@ -6388,7 +6439,8 @@ export const operations: Operation[] = [
   get_page, put_page, create_page_file_exact, put_page_file_exact, reindex_page_links_exact, patch_page_metadata_exact,
   soft_delete_page_exact, delete_page, list_pages,
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)
-  restore_page_exact, restore_page, purge_pages_exact, inventory_deleted_pages_exact, purge_deleted_pages,
+  restore_page_exact, restore_page, purge_pages_exact, inventory_deleted_pages_exact,
+  inventory_soft_delete_candidates_exact, purge_deleted_pages,
   // Search
   search, query,
   // v0.36 Phase 2: image-as-query
