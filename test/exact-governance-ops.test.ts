@@ -652,6 +652,68 @@ describe('put_page_file_exact', () => {
 });
 
 describe('reindex_page_links_exact', () => {
+  test('indexes an exact wikilink in a custom namespace without rewriting the page', async () => {
+    const op = operationsByName.reindex_page_links_exact;
+    const origin = 'codex/checkpoints/sprint-2';
+    const target = 'codex/canonical-summaries/astro7-kintsugi-backlink-rewire-consolidation';
+    await engine.putPage(target, {
+      type: 'note', title: 'Canonical summary', compiled_truth: 'summary', timeline: '', frontmatter: {},
+    });
+    await engine.putPage(origin, {
+      type: 'note', title: 'Sprint checkpoint',
+      compiled_truth: `Durable state: [[${target}]]`, timeline: '', frontmatter: {},
+    });
+    const before = (await engine.getPage(origin))!;
+    const beforeMarkdownSha256 = await renderedMarkdownSha256(origin);
+    const beforeCounts = await counts();
+
+    const result = await op.handler(ctx(), {
+      slug: origin,
+      expected_content_hash: before.content_hash,
+      expected_markdown_sha256: beforeMarkdownSha256,
+    }) as any;
+    const after = (await engine.getPage(origin))!;
+    const links = await engine.getLinks(origin, { sourceId: 'default' });
+
+    expect(result).toMatchObject({
+      status: 'reindexed', slug: origin, content_hash: before.content_hash, created: 1, removed: 0,
+    });
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({
+      from_slug: origin,
+      to_slug: target,
+      link_source: 'markdown',
+    });
+    expect(after.content_hash).toBe(before.content_hash);
+    expect(after.updated_at.getTime()).toBe(before.updated_at.getTime());
+    expect(await renderedMarkdownSha256(origin)).toBe(beforeMarkdownSha256);
+    expect(await counts()).toEqual(beforeCounts);
+  });
+
+  test('drops a missing custom-namespace wikilink without creating a dangling edge', async () => {
+    const op = operationsByName.reindex_page_links_exact;
+    const origin = 'codex/checkpoints/missing-target';
+    const target = 'codex/canonical-summaries/does-not-exist';
+    await engine.putPage(origin, {
+      type: 'note', title: 'Missing target',
+      compiled_truth: `Unresolved optional reference: [[${target}]]`, timeline: '', frontmatter: {},
+    });
+    const before = (await engine.getPage(origin))!;
+    const beforeMarkdownSha256 = await renderedMarkdownSha256(origin);
+    const beforeCounts = await counts();
+
+    const result = await op.handler(ctx(), {
+      slug: origin,
+      expected_content_hash: before.content_hash,
+      expected_markdown_sha256: beforeMarkdownSha256,
+    }) as any;
+
+    expect(result).toMatchObject({ status: 'reindexed', created: 0, removed: 0 });
+    expect(await engine.getLinks(origin, { sourceId: 'default' })).toEqual([]);
+    expect(await renderedMarkdownSha256(origin)).toBe(beforeMarkdownSha256);
+    expect(await counts()).toEqual(beforeCounts);
+  });
+
   test('repairs a fuzzy same-basename frontmatter edge without rewriting the page or creating a version', async () => {
     const op = operationsByName.reindex_page_links_exact;
     expect(op.localOnly).toBe(true);

@@ -297,6 +297,53 @@ describe('extractPageLinks', () => {
 
   // ─── issue #972: bare wikilink → resolver.resolveBasenameMatches ─────────
 
+  test('custom-namespace wikilink emits a literal markdown candidate with basename mode off', async () => {
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async () => {
+        throw new Error('slash-qualified refs must not use basename resolution');
+      },
+    };
+    const { candidates } = await extractPageLinks(
+      'codex/checkpoints/sprint-2',
+      'See [[codex/canonical-summaries/astro7-kintsugi]] for the durable state.',
+      {}, 'note', resolver,
+    );
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].targetSlug).toBe('codex/canonical-summaries/astro7-kintsugi');
+    expect(candidates[0].linkSource).toBe('markdown');
+    expect(candidates[0].linkType).not.toBe('wikilink_basename');
+  });
+
+  test('custom-namespace wikilink is not duplicated when basename mode is on', async () => {
+    let basenameCalls = 0;
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async () => {
+        basenameCalls++;
+        return ['codex/canonical-summaries/astro7-kintsugi'];
+      },
+    };
+    const { candidates } = await extractPageLinks(
+      'codex/checkpoints/sprint-2',
+      'See [[codex/canonical-summaries/astro7-kintsugi]].',
+      {}, 'note', resolver, { globalBasename: true },
+    );
+    expect(candidates.map(c => c.targetSlug)).toEqual([
+      'codex/canonical-summaries/astro7-kintsugi',
+    ]);
+    expect(basenameCalls).toBe(0);
+  });
+
+  test('custom-namespace self-link is dropped', async () => {
+    const { candidates } = await extractPageLinks(
+      'codex/checkpoints/sprint-2',
+      'See [[codex/checkpoints/sprint-2]].',
+      {}, 'note', nullResolver,
+    );
+    expect(candidates).toEqual([]);
+  });
+
   test('bare wikilink drops silently when globalBasename flag is OFF', async () => {
     // Resolver that WOULD resolve, but we never reach it because the
     // flag is off — this is the back-compat invariant.
