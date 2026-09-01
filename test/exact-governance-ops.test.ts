@@ -824,6 +824,7 @@ describe('reindex_page_links_exact', () => {
 
   test('fails before mutation on remote, stale preimage, or unresolved frontmatter', async () => {
     const op = operationsByName.reindex_page_links_exact;
+    const planner = operationsByName.plan_reindex_page_links_exact;
     const origin = 'projects/reindex-gates';
     await engine.putPage(origin, {
       type: 'note', title: 'Gates', compiled_truth: 'unchanged', timeline: '',
@@ -837,6 +838,11 @@ describe('reindex_page_links_exact', () => {
     await expect(op.handler({ ...ctx(), remote: true }, params)).rejects.toThrow('local-only');
     await expect(op.handler(ctx(), { ...params, expected_content_hash: '0'.repeat(64) })).rejects.toThrow('preimage hash drift');
     await expect(op.handler(ctx(), { ...params, expected_markdown_sha256: '0'.repeat(64) })).rejects.toThrow('markdown drift');
+    const blocked = await planner.handler(ctx(), params) as any;
+    expect(blocked).toEqual({
+      status: 'blocked', slug: origin, reason: 'unresolved_frontmatter', unresolved_reference_count: 1,
+    });
+    expect(JSON.stringify(blocked)).not.toContain('missing/nested/page');
     await expect(op.handler(ctx(), params)).rejects.toThrow('unresolved frontmatter');
     expect(await engine.getLinks(origin, { sourceId: 'default' })).toEqual([]);
     expect(await counts()).toEqual(baseline);

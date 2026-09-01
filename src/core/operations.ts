@@ -1495,7 +1495,12 @@ async function planExactLinkProjection(
     { globalBasename },
   );
   if (extracted.unresolved.length > 0) {
-    throw new OperationError('storage_error', `exact link reindex plan has ${extracted.unresolved.length} unresolved frontmatter reference(s)`);
+    return {
+      status: 'blocked',
+      slug,
+      reason: 'unresolved_frontmatter',
+      unresolved_reference_count: extracted.unresolved.length,
+    };
   }
   const sourceOpts = { sourceId };
   const allSlugs = await engine.getAllSlugs(sourceOpts);
