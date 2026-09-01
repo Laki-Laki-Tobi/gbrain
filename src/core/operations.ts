@@ -3173,6 +3173,8 @@ const purge_pages_exact: Operation = {
     expected_fingerprint: { type: 'string' },
     apply_enabled: { type: 'boolean' },
     accept_ambiguous_commit: { type: 'boolean' },
+    grace_waiver_receipt_path: { type: 'string', description: 'Absolute path to the one-off private grace-waiver receipt.' },
+    grace_waiver_receipt_sha256: { type: 'string', description: 'Exact SHA-256 of the grace-waiver receipt bytes.' },
   },
   mutating: true,
   scope: 'admin',
@@ -3201,6 +3203,12 @@ const purge_pages_exact: Operation = {
         return { slug, deletedAt: entry.deleted_at, contentHash: entry.content_hash };
       });
     }
+    if (p.grace_waiver_receipt_path !== undefined && typeof p.grace_waiver_receipt_path !== 'string') {
+      throw new OperationError('invalid_params', 'grace_waiver_receipt_path must be a string');
+    }
+    if (p.grace_waiver_receipt_sha256 !== undefined && typeof p.grace_waiver_receipt_sha256 !== 'string') {
+      throw new OperationError('invalid_params', 'grace_waiver_receipt_sha256 must be a string');
+    }
     if (ctx.dryRun && action !== 'plan') {
       return { dry_run: true, action: `purge_pages_exact:${action}`, run_id: runId };
     }
@@ -3213,6 +3221,8 @@ const purge_pages_exact: Operation = {
         expectedFingerprint: typeof p.expected_fingerprint === 'string' ? p.expected_fingerprint : undefined,
         applyEnabled: p.apply_enabled === true,
         acceptAmbiguousCommit: p.accept_ambiguous_commit === true,
+        graceWaiverReceiptPath: p.grace_waiver_receipt_path as string | undefined,
+        graceWaiverReceiptSha256: p.grace_waiver_receipt_sha256 as string | undefined,
       });
     } catch (error) {
       throw new OperationError('storage_error', error instanceof Error ? error.message : String(error));

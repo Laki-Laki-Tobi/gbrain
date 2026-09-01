@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, link, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { chmod, link, lstat, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
@@ -15,6 +16,10 @@ const VERIFY_SCHEMA = 'gbrain-purge-pages-exact-verify-v3';
 const ROLLBACK_SCHEMA = 'gbrain-purge-pages-exact-rollback-v3';
 const MINIMUM_DELETED_AGE_DAYS = 3;
 const MAX_BACKUP_BYTES = 64 * 1024 * 1024;
+const GRACE_WAIVER_SCHEMA = 'gbrain-purge-pages-exact-grace-waiver-v1';
+const GRACE_WAIVER_POLICY_VERSION = 'solo-founder-remediation-2026-09-01';
+const GRACE_WAIVER_PURPOSE = 'one_off_physical_purge_grace_waiver';
+const MAX_GRACE_WAIVER_BYTES = 64 * 1024;
 
 export interface PurgeAllowlistEntry {
   slug: string;
@@ -30,6 +35,8 @@ export interface PurgePagesExactArgs {
   expectedFingerprint?: string;
   applyEnabled: boolean;
   acceptAmbiguousCommit: boolean;
+  graceWaiverReceiptPath?: string;
+  graceWaiverReceiptSha256?: string;
 }
 
 export interface InventoryDeletedPagesExactArgs {
@@ -611,13 +618,103 @@ async function tryReadJson(file: string): Promise<any | null> {
   }
 }
 
+interface GraceWaiverReceipt {
+  schema_version: typeof GRACE_WAIVER_SCHEMA;
+  policy_version: typeof GRACE_WAIVER_POLICY_VERSION;
+  run_id: string;
+  source_id: string;
+  allowlist_fingerprint: string;
+  purpose: typeof GRACE_WAIVER_PURPOSE;
+  minimum_deleted_age_days: 0;
+  approved_by: 'operator';
+  approval_timestamp: string;
+}
+
+class GraceWaiverValidationError extends Error {}
+
+function graceWaiverRequested(args: PurgePagesExactArgs): boolean {
+  const hasPath = args.graceWaiverReceiptPath !== undefined;
+  const hasSha256 = args.graceWaiverReceiptSha256 !== undefined;
+  if (hasPath !== hasSha256) {
+    throw new Error('grace waiver receipt path and sha256 must be supplied together');
+  }
+  return hasPath;
+}
+
+async function validateGraceWaiver(
+  args: PurgePagesExactArgs,
+  allowlistFingerprint: string,
+): Promise<void> {
+  if (!graceWaiverRequested(args)) return;
+  const filePath = args.graceWaiverReceiptPath!;
+  const expectedSha256 = args.graceWaiverReceiptSha256!;
+  if (!path.isAbsolute(filePath)) throw new Error('grace waiver receipt path must be absolute');
+  if (!/^[a-f0-9]{64}$/.test(expectedSha256)) throw new Error('grace waiver receipt sha256 must be sha256 hex');
+
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    const pathStat = await lstat(filePath);
+    if (!pathStat.isFile()) throw new GraceWaiverValidationError('grace waiver receipt must be a regular file');
+    handle = await open(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const fileStat = await handle.stat();
+    if (!fileStat.isFile() || fileStat.dev !== pathStat.dev || fileStat.ino !== pathStat.ino) {
+      throw new GraceWaiverValidationError('grace waiver receipt must be a stable regular file');
+    }
+    if ((fileStat.mode & 0o7777) !== 0o600) throw new GraceWaiverValidationError('grace waiver receipt must have mode 0600');
+    if (fileStat.size > MAX_GRACE_WAIVER_BYTES) throw new GraceWaiverValidationError('grace waiver receipt exceeds maximum size');
+    const bytes = await handle.readFile();
+    if (bytes.byteLength > MAX_GRACE_WAIVER_BYTES) throw new GraceWaiverValidationError('grace waiver receipt exceeds maximum size');
+    if (sha256(bytes) !== expectedSha256) throw new GraceWaiverValidationError('grace waiver receipt sha256 mismatch');
+    if (bytes.includes(0)) throw new GraceWaiverValidationError('grace waiver receipt must be UTF-8 JSON');
+    let receipt: unknown;
+    try {
+      receipt = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    } catch {
+      throw new GraceWaiverValidationError('grace waiver receipt must be UTF-8 JSON');
+    }
+    if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) {
+      throw new GraceWaiverValidationError('grace waiver receipt schema mismatch');
+    }
+    const expectedKeys = [
+      'allowlist_fingerprint', 'approval_timestamp', 'approved_by', 'minimum_deleted_age_days',
+      'policy_version', 'purpose', 'run_id', 'schema_version', 'source_id',
+    ];
+    const keys = Object.keys(receipt).sort();
+    if (stableJson(keys) !== stableJson(expectedKeys)) throw new GraceWaiverValidationError('grace waiver receipt schema mismatch');
+    const value = receipt as GraceWaiverReceipt;
+    if (value.schema_version !== GRACE_WAIVER_SCHEMA
+      || value.policy_version !== GRACE_WAIVER_POLICY_VERSION
+      || value.run_id !== args.runId
+      || value.source_id !== args.sourceId
+      || value.allowlist_fingerprint !== allowlistFingerprint
+      || value.purpose !== GRACE_WAIVER_PURPOSE
+      || value.minimum_deleted_age_days !== 0
+      || value.approved_by !== 'operator'
+      || typeof value.approval_timestamp !== 'string'
+      || !Number.isFinite(Date.parse(value.approval_timestamp))) {
+      throw new GraceWaiverValidationError('grace waiver receipt does not bind this purge request');
+    }
+  } catch (error) {
+    if (error instanceof GraceWaiverValidationError) throw error;
+    throw new Error('grace waiver receipt could not be opened or validated');
+  } finally {
+    await handle?.close();
+  }
+}
+
+function effectiveMinimumDeletedAgeDays(args: PurgePagesExactArgs): number {
+  return graceWaiverRequested(args) ? 0 : MINIMUM_DELETED_AGE_DAYS;
+}
+
 function policyShape(args: PurgePagesExactArgs): Record<string, unknown> {
   return {
     policy_version: POLICY_VERSION,
     source_id: args.sourceId,
     run_id: args.runId,
-    minimum_deleted_age_days: MINIMUM_DELETED_AGE_DAYS,
+    minimum_deleted_age_days: effectiveMinimumDeletedAgeDays(args),
     maximum_backup_bytes: MAX_BACKUP_BYTES,
+    grace_waiver_applied: graceWaiverRequested(args),
+    grace_waiver_receipt_sha256: args.graceWaiverReceiptSha256 ?? null,
   };
 }
 
@@ -818,16 +915,20 @@ function assertAllowlistMatchesPages(entries: PurgeAllowlistEntry[], pages: Json
   }
 }
 
-async function assertMinimumDeletedAge(engine: BrainEngine, pages: JsonRow[]): Promise<void> {
+async function assertMinimumDeletedAge(
+  engine: BrainEngine,
+  pages: JsonRow[],
+  minimumDeletedAgeDays: number,
+): Promise<void> {
   const pageIds = numericIds(pages);
   const tooYoung = await engine.executeRaw<{ slug: string }>(`
     SELECT slug FROM pages
      WHERE id = ANY($1::int[])
-       AND (deleted_at IS NULL OR deleted_at > now() - interval '3 days')
+       AND (deleted_at IS NULL OR deleted_at > now() - ($2::int * interval '1 day'))
      ORDER BY slug
-  `, [pageIds]);
+  `, [pageIds, minimumDeletedAgeDays]);
   if (tooYoung.length > 0) {
-    throw new Error(`purge target is younger than ${MINIMUM_DELETED_AGE_DAYS} days: ${tooYoung[0].slug}`);
+    throw new Error(`purge target is younger than ${minimumDeletedAgeDays} days: ${tooYoung[0].slug}`);
   }
 }
 
@@ -940,6 +1041,8 @@ async function plan(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Rec
   if (!args.allowlist) throw new Error('allowlist is required for plan');
   const entries = canonicalAllowlist(args.allowlist);
   const allowlistFingerprint = fingerprint(entries);
+  await validateGraceWaiver(args, allowlistFingerprint);
+  const minimumDeletedAgeDays = effectiveMinimumDeletedAgeDays(args);
   const prior = await tryReadJson(artifact(args, 'plan.json'));
   if (prior) {
     assertPolicy(prior, args);
@@ -964,7 +1067,7 @@ async function plan(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Rec
     }
     const pages = await pagesBySourceSlugs(tx, args.sourceId, entries.map((entry) => entry.slug));
     assertAllowlistMatchesPages(entries, pages, args.sourceId);
-    await assertMinimumDeletedAge(tx, pages);
+    await assertMinimumDeletedAge(tx, pages, minimumDeletedAgeDays);
     const dependencyCounts = await activeDependencyCounts(
       tx, args.sourceId, numericIds(pages), entries.map((entry) => entry.slug),
     );
@@ -1214,6 +1317,8 @@ async function apply(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Re
   if (!args.applyEnabled) throw new Error('purge apply requires apply_enabled=true');
   if (!/^[a-f0-9]{64}$/.test(args.expectedFingerprint || '')) throw new Error('expected_fingerprint is required');
   const planReport = await readJson(artifact(args, 'plan.json'));
+  await validateGraceWaiver(args, String(planReport.allowlist_fingerprint));
+  const minimumDeletedAgeDays = effectiveMinimumDeletedAgeDays(args);
   const { bytes, payload: backup } = await loadBackup(args);
   assertPlanAndBackup(planReport, backup, bytes, args);
   if (planReport.allowlist_fingerprint !== args.expectedFingerprint) throw new Error('allowlist fingerprint mismatch');
@@ -1271,7 +1376,7 @@ async function apply(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Re
       const lockedPages = await pagesByIdsForUpdate(tx, pageIds);
       if (lockedPages.length !== pageIds.length) throw new Error('purge targets became partially absent');
       assertPageIdentitiesMatchBackup(lockedPages, backup.rows.pages, args.sourceId);
-      await assertMinimumDeletedAge(tx, lockedPages);
+      await assertMinimumDeletedAge(tx, lockedPages, minimumDeletedAgeDays);
       const dependencies = await activeDependencyCounts(tx, args.sourceId, pageIds, slugs);
       assertNoActiveDependencies(dependencies);
       const currentGraph = await captureGraph(tx, lockedPages);
@@ -1297,9 +1402,9 @@ async function apply(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Re
           DELETE FROM pages
            WHERE id = $1::int AND source_id = $2 AND slug = $3
              AND deleted_at = $4::timestamptz AND content_hash = $5
-             AND deleted_at <= now() - interval '3 days'
+             AND deleted_at <= now() - ($6::int * interval '1 day')
            RETURNING id
-        `, [Number(page.id), args.sourceId, page.slug, page.deleted_at, page.content_hash]);
+        `, [Number(page.id), args.sourceId, page.slug, page.deleted_at, page.content_hash, minimumDeletedAgeDays]);
         if (deleted.length !== 1) throw new Error(`purge delete identity mismatch for ${String(page.slug)}`);
       }
     });
@@ -1326,6 +1431,7 @@ async function apply(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Re
 async function verify(engine: BrainEngine, args: PurgePagesExactArgs): Promise<Record<string, unknown>> {
   const planReport = await readJson(artifact(args, 'plan.json'));
   const applyReport = await readJson(artifact(args, 'apply.json'));
+  await validateGraceWaiver(args, String(planReport.allowlist_fingerprint));
   const { bytes, payload: backup } = await loadBackup(args);
   assertPlanAndBackup(planReport, backup, bytes, args);
   assertPolicy(applyReport, args);
@@ -1463,6 +1569,7 @@ async function rollback(engine: BrainEngine, args: PurgePagesExactArgs): Promise
   if (!/^[a-f0-9]{64}$/.test(args.expectedFingerprint || '')) throw new Error('expected_fingerprint is required');
   const planReport = await readJson(artifact(args, 'plan.json'));
   const applyReport = await readJson(artifact(args, 'apply.json'));
+  await validateGraceWaiver(args, String(planReport.allowlist_fingerprint));
   const { bytes, payload: backup } = await loadBackup(args);
   assertPlanAndBackup(planReport, backup, bytes, args);
   assertPolicy(applyReport, args);
