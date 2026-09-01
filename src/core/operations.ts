@@ -1195,6 +1195,19 @@ function requireLowercaseExactSlug(value: unknown): string {
   return value;
 }
 
+function requireLowercaseLegacyExactSlug(value: unknown): string {
+  if (typeof value !== 'string'
+    || value.length === 0
+    || value.length > 255
+    || !/^[a-z0-9_][a-z0-9._-]*(?:\/[a-z0-9_][a-z0-9._-]*)*$/.test(value)) {
+    throw new OperationError(
+      'invalid_params',
+      'slug must be a lowercase path-safe legacy exact slug',
+    );
+  }
+  return value;
+}
+
 function parsedPageFromContent(content: string, slug: string): ParsedPage {
   const parsed = parseMarkdown(content, `${slug}.md`);
   return {
@@ -3112,7 +3125,7 @@ const inventory_soft_delete_candidates_exact: Operation = {
       if (Object.keys(entry).some((key) => !['slug', 'expected_raw_markdown_sha256'].includes(key))) {
         throw new OperationError('invalid_params', `entries[${index}] has unknown fields`);
       }
-      const slug = requireLowercaseExactSlug(entry.slug);
+      const slug = requireLowercaseLegacyExactSlug(entry.slug);
       const expectedRawMarkdownSha256 = entry.expected_raw_markdown_sha256;
       if (typeof expectedRawMarkdownSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(expectedRawMarkdownSha256)) {
         throw new OperationError('invalid_params', `entries[${index}].expected_raw_markdown_sha256 must be lowercase sha256 hex`);
