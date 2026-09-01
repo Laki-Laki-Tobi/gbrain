@@ -41,6 +41,7 @@ import { VERSION } from '../version.ts';
 import { runPageVersionRetention } from './page-version-retention.ts';
 import {
   inventoryDeletedPagesExact,
+  inventorySoftDeleteBacklinksExact,
   inventorySoftDeleteCandidatesExact,
   runPurgePagesExact,
   type PurgeAllowlistEntry,
@@ -3145,6 +3146,38 @@ const inventory_soft_delete_candidates_exact: Operation = {
     }
   },
   cliHints: { name: 'inventory-soft-delete-candidates-exact' },
+};
+
+const inventory_soft_delete_backlinks_exact: Operation = {
+  name: 'inventory_soft_delete_backlinks_exact',
+  description: 'Local-admin read-only exact backlink provenance inventory for reviewed soft-delete targets.',
+  params: {
+    slugs: { type: 'array', required: true, items: { type: 'string' } },
+  },
+  mutating: false,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError('permission_denied', 'inventory_soft_delete_backlinks_exact is local-only and must be called through the local CLI.');
+    }
+    if (!Array.isArray(p.slugs) || p.slugs.length < 1 || p.slugs.length > 500) {
+      throw new OperationError('invalid_params', 'slugs must contain between 1 and 500 exact targets');
+    }
+    const slugs = p.slugs.map(requireLowercaseLegacyExactSlug).sort((left, right) => left.localeCompare(right));
+    if (new Set(slugs).size !== slugs.length) {
+      throw new OperationError('invalid_params', 'slugs must not contain duplicates');
+    }
+    try {
+      return await inventorySoftDeleteBacklinksExact(ctx.engine, {
+        sourceId: ctx.sourceId || 'default',
+        slugs,
+      });
+    } catch (error) {
+      throw new OperationError('storage_error', error instanceof Error ? error.message : String(error));
+    }
+  },
+  cliHints: { name: 'inventory-soft-delete-backlinks-exact' },
 };
 
 const get_links: Operation = {
@@ -6453,7 +6486,7 @@ export const operations: Operation[] = [
   soft_delete_page_exact, delete_page, list_pages,
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)
   restore_page_exact, restore_page, purge_pages_exact, inventory_deleted_pages_exact,
-  inventory_soft_delete_candidates_exact, purge_deleted_pages,
+  inventory_soft_delete_candidates_exact, inventory_soft_delete_backlinks_exact, purge_deleted_pages,
   // Search
   search, query,
   // v0.36 Phase 2: image-as-query

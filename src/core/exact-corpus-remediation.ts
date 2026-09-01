@@ -50,6 +50,11 @@ export interface InventorySoftDeleteCandidatesExactArgs {
   entries: SoftDeleteCandidateExactEntry[];
 }
 
+export interface InventorySoftDeleteBacklinksExactArgs {
+  sourceId: string;
+  slugs: string[];
+}
+
 interface DeletedPageInventoryDbRow {
   slug: string;
   state: 'deleted' | 'missing' | 'restored';
@@ -81,6 +86,28 @@ interface SoftDeleteCandidateInventoryDbRow {
   source_id: string | null;
   tags: string[] | null;
   inbound_count: number | string;
+}
+
+interface SoftDeleteBacklinkInventoryDbRow {
+  requested_slug: string;
+  target_id: number | null;
+  target_deleted_at: Date | string | null;
+  link_id: number | null;
+  from_slug: string | null;
+  to_slug: string | null;
+  link_type: string | null;
+  context: string | null;
+  link_source: string | null;
+  link_kind: 'plain' | 'typed_ner' | null;
+  origin_slug: string | null;
+  origin_field: string | null;
+  resolution_type: 'qualified' | 'unqualified' | null;
+  from_source_id: string | null;
+  to_source_id: string | null;
+  origin_source_id: string | null;
+  from_deleted_at: Date | string | null;
+  to_deleted_at: Date | string | null;
+  origin_deleted_at: Date | string | null;
 }
 
 type JsonRow = Record<string, unknown>;
@@ -398,6 +425,117 @@ export async function inventorySoftDeleteCandidatesExact(
     },
     fingerprint: fingerprint({ source_id: args.sourceId, rows: inventory }),
   };
+}
+
+/** Read-only exact-edge census for reviewed soft-delete blockers.
+ * Targets are scoped to sourceId. Cross-source referrers remain visible to this
+ * local-admin operation so governance can hold them instead of accidentally
+ * treating them as removable source-local edges. No page bodies are selected. */
+export async function inventorySoftDeleteBacklinksExact(
+  engine: BrainEngine,
+  args: InventorySoftDeleteBacklinksExactArgs,
+): Promise<Record<string, unknown>> {
+  const rows = await engine.executeRaw<SoftDeleteBacklinkInventoryDbRow>(
+    `WITH requested AS (
+       SELECT slug
+         FROM jsonb_array_elements_text($2::text::jsonb) AS entry(slug)
+     )
+     SELECT r.slug AS requested_slug,
+            t.id AS target_id,
+            t.deleted_at AS target_deleted_at,
+            l.id AS link_id,
+            f.slug AS from_slug,
+            t.slug AS to_slug,
+            l.link_type,
+            l.context,
+            l.link_source,
+            l.link_kind,
+            o.slug AS origin_slug,
+            l.origin_field,
+            l.resolution_type,
+            f.source_id AS from_source_id,
+            t.source_id AS to_source_id,
+            o.source_id AS origin_source_id,
+            f.deleted_at AS from_deleted_at,
+            t.deleted_at AS to_deleted_at,
+            o.deleted_at AS origin_deleted_at
+       FROM requested r
+       LEFT JOIN pages t ON t.source_id = $1 AND t.slug = r.slug
+       LEFT JOIN links l ON l.to_page_id = t.id
+       LEFT JOIN pages f ON f.id = l.from_page_id
+       LEFT JOIN pages o ON o.id = l.origin_page_id
+      WHERE l.id IS NULL OR l.origin_page_id IS NULL OR o.id IS NOT NULL
+      ORDER BY r.slug, f.source_id, f.slug, l.link_type, l.link_source NULLS FIRST,
+               o.source_id NULLS FIRST, o.slug NULLS FIRST, l.origin_field NULLS FIRST,
+               l.resolution_type NULLS FIRST, l.context`,
+    [args.sourceId, JSON.stringify(args.slugs)],
+  );
+
+  const targets = new Map<string, { slug: string; state: 'active' | 'soft_deleted' | 'missing'; edge_count: number }>();
+  const edges: Record<string, unknown>[] = [];
+  for (const row of rows) {
+    const state = row.target_id === null ? 'missing' : row.target_deleted_at === null ? 'active' : 'soft_deleted';
+    const target = targets.get(row.requested_slug) ?? { slug: row.requested_slug, state, edge_count: 0 };
+    if (target.state !== state) throw new Error(`backlink inventory target state changed for ${row.requested_slug}`);
+    targets.set(row.requested_slug, target);
+    if (row.link_id === null) continue;
+    if (
+      row.from_slug === null || row.to_slug !== row.requested_slug ||
+      row.link_type === null || row.context === null ||
+      row.from_source_id === null || row.to_source_id === null
+    ) {
+      throw new Error(`backlink inventory exact identity is incomplete for ${row.requested_slug}`);
+    }
+    if (row.resolution_type !== null && row.resolution_type !== 'qualified' && row.resolution_type !== 'unqualified') {
+      throw new Error(`backlink inventory resolution type is invalid for ${row.requested_slug}`);
+    }
+    if (row.link_kind !== null && row.link_kind !== 'plain' && row.link_kind !== 'typed_ner') {
+      throw new Error(`backlink inventory link kind is invalid for ${row.requested_slug}`);
+    }
+    target.edge_count += 1;
+    const sourceLocal = row.from_source_id === args.sourceId
+      && row.to_source_id === args.sourceId
+      && (row.origin_slug === null || row.origin_source_id === args.sourceId);
+    edges.push({
+      from_slug: row.from_slug,
+      to_slug: row.to_slug,
+      link_type: row.link_type,
+      context: row.context,
+      link_source: row.link_source,
+      link_kind: row.link_kind,
+      origin_slug: row.origin_slug,
+      origin_field: row.origin_field,
+      resolution_type: row.resolution_type,
+      from_source_id: row.from_source_id,
+      to_source_id: row.to_source_id,
+      origin_source_id: row.origin_source_id,
+      from_state: row.from_deleted_at === null ? 'active' : 'soft_deleted',
+      to_state: row.to_deleted_at === null ? 'active' : 'soft_deleted',
+      origin_state: row.origin_slug === null ? null : row.origin_deleted_at === null ? 'active' : 'soft_deleted',
+      source_local: sourceLocal,
+    });
+  }
+  for (const slug of args.slugs) {
+    if (!targets.has(slug)) throw new Error(`backlink inventory omitted requested target ${slug}`);
+  }
+  const binaryCompare = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
+  const targetRows = [...targets.values()].sort((left, right) => binaryCompare(left.slug, right.slug));
+  edges.sort((left, right) => binaryCompare(stableJson(left), stableJson(right)));
+  const result = {
+    source_id: args.sourceId,
+    targets: targetRows,
+    edges,
+    counts: {
+      requested: args.slugs.length,
+      active_targets: targetRows.filter((row) => row.state === 'active').length,
+      soft_deleted_targets: targetRows.filter((row) => row.state === 'soft_deleted').length,
+      missing_targets: targetRows.filter((row) => row.state === 'missing').length,
+      edges: edges.length,
+      source_local_edges: edges.filter((edge) => edge.source_local === true).length,
+      cross_source_edges: edges.filter((edge) => edge.source_local === false).length,
+    },
+  };
+  return { ...result, fingerprint: fingerprint(result) };
 }
 
 function backupRoot(): string {
