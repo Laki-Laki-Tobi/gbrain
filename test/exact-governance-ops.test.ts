@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { appendFile, chmod, mkdtemp, readFile, rm, stat, symlink, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { computeImportContentHash } from '../src/core/import-file.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../src/core/markdown.ts';
@@ -1414,6 +1415,43 @@ describe('purge_pages_exact', () => {
     return { slug: page.slug, deleted_at: page.deleted_at.toISOString(), content_hash: page.content_hash };
   }
 
+  function allowlistFingerprint(entries: Record<string, string>[]): string {
+    const canonical = entries.map((item) => Object.fromEntries(Object.entries({
+      slug: item.slug,
+      deletedAt: new Date(item.deleted_at).toISOString(),
+      contentHash: item.content_hash,
+    }).sort(([left], [right]) => left.localeCompare(right))))
+      .sort((left, right) => String(left.slug).localeCompare(String(right.slug)));
+    return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+  }
+
+  async function writeGraceWaiver(
+    home: string,
+    runId: string,
+    entries: Record<string, string>[],
+    sourceId = 'default',
+  ): Promise<{ grace_waiver_receipt_path: string; grace_waiver_receipt_sha256: string }> {
+    const receiptPath = join(home, 'one-off-grace-waiver.json');
+    const receipt = {
+      schema_version: 'gbrain-purge-pages-exact-grace-waiver-v1',
+      policy_version: 'solo-founder-remediation-2026-09-01',
+      run_id: runId,
+      source_id: sourceId,
+      allowlist_fingerprint: allowlistFingerprint(entries),
+      purpose: 'one_off_physical_purge_grace_waiver',
+      minimum_deleted_age_days: 0,
+      approved_by: 'operator',
+      approval_timestamp: '2026-09-01T00:00:00Z',
+    };
+    const content = JSON.stringify(receipt);
+    await writeFile(receiptPath, content, { mode: 0o600 });
+    await chmod(receiptPath, 0o600);
+    return {
+      grace_waiver_receipt_path: receiptPath,
+      grace_waiver_receipt_sha256: createHash('sha256').update(content).digest('hex'),
+    };
+  }
+
   test('rejects an empty or over-100 allowlist before any purge plan can be created', async () => {
     const op = operationsByName.purge_pages_exact;
     const timestamp = new Date().toISOString();
@@ -1452,6 +1490,155 @@ describe('purge_pages_exact', () => {
         await expect(op.handler(ctx(), {
           action: 'plan', run_id: 'active-inbound-gate', allowlist: [entry(old)],
         })).rejects.toThrow('active dependency gate failed');
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test('requires an exact private one-off waiver to purge a fresh tombstone through every phase', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const page = await seedPurgePage('archive/grace-waiver', 'fresh body', 0);
+    const entries = [entry(page)];
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-purge-grace-waiver-home-'));
+    const runId = 'grace-waiver-roundtrip';
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        const waiver = await writeGraceWaiver(home, runId, entries);
+        const params = { action: 'plan', run_id: runId, allowlist: entries, ...waiver };
+        const plan = await op.handler(ctx(), params) as any;
+        expect(plan.minimum_deleted_age_days).toBe(0);
+        expect(plan.grace_waiver_applied).toBe(true);
+        expect(plan.grace_waiver_receipt_sha256).toBe(waiver.grace_waiver_receipt_sha256);
+        expect(JSON.stringify(plan)).not.toContain(waiver.grace_waiver_receipt_path);
+        expect(plan).not.toHaveProperty('grace_waiver_receipt_body');
+
+        await expect(op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+          grace_waiver_receipt_path: undefined, grace_waiver_receipt_sha256: undefined,
+        })).rejects.toThrow('policy mismatch');
+
+        await op.handler(ctx(), {
+          ...params, action: 'apply', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        });
+        await expect(op.handler(ctx(), {
+          ...params, action: 'verify',
+          grace_waiver_receipt_path: undefined, grace_waiver_receipt_sha256: undefined,
+        })).rejects.toThrow('policy mismatch');
+        expect((await op.handler(ctx(), { ...params, action: 'verify' }) as any).status).toBe('pass');
+        await expect(op.handler(ctx(), {
+          ...params, action: 'rollback', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+          grace_waiver_receipt_path: undefined, grace_waiver_receipt_sha256: undefined,
+        })).rejects.toThrow('policy mismatch');
+        expect((await op.handler(ctx(), {
+          ...params, action: 'rollback', expected_fingerprint: plan.allowlist_fingerprint, apply_enabled: true,
+        }) as any).status).toBe('pass');
+
+        const artifactDir = join(home, 'governance-backups', 'page-purge-exact', runId);
+        const artifactTexts = await Promise.all([
+          'plan.json', 'apply-intent.json', 'apply.json', 'verify.json', 'rollback-intent.json', 'rollback.json',
+        ].map((name) => readFile(join(artifactDir, name), 'utf8')));
+        artifactTexts.push(gunzipSync(await readFile(join(artifactDir, 'backup.json.gz'))).toString('utf8'));
+        expect(artifactTexts.join('\n')).not.toContain(waiver.grace_waiver_receipt_path);
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('rejects malformed, swapped, and mismatched grace-waiver receipts before planning', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const page = await seedPurgePage('archive/grace-waiver-rejections', 'fresh body', 0);
+    const entries = [entry(page)];
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-purge-grace-waiver-rejections-home-'));
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        const waiver = await writeGraceWaiver(home, 'grace-waiver-rejections', entries);
+        const params = { action: 'plan', run_id: 'grace-waiver-rejections', allowlist: entries, ...waiver };
+
+        const missingReceiptPath = join(home, 'missing-grace-waiver.json');
+        try {
+          await op.handler(ctx(), {
+            ...params, grace_waiver_receipt_path: missingReceiptPath,
+          });
+          throw new Error('missing receipt unexpectedly passed');
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          expect(message).toContain('could not be opened or validated');
+          expect(message).not.toContain(missingReceiptPath);
+        }
+
+        await chmod(waiver.grace_waiver_receipt_path, 0o644);
+        await expect(op.handler(ctx(), params)).rejects.toThrow('mode 0600');
+        await chmod(waiver.grace_waiver_receipt_path, 0o600);
+        await expect(op.handler(ctx(), { ...params, grace_waiver_receipt_sha256: '0'.repeat(64) })).rejects.toThrow('sha256 mismatch');
+        await expect(op.handler(ctx(), {
+          ...params, grace_waiver_receipt_path: undefined,
+        })).rejects.toThrow('supplied together');
+        await expect(op.handler(ctx(), {
+          ...params, grace_waiver_receipt_sha256: undefined,
+        })).rejects.toThrow('supplied together');
+        await expect(op.handler(ctx(), {
+          ...params, grace_waiver_receipt_path: 'one-off-grace-waiver.json',
+        })).rejects.toThrow('must be absolute');
+
+        const symlinkPath = join(home, 'one-off-grace-waiver-symlink.json');
+        await symlink(waiver.grace_waiver_receipt_path, symlinkPath);
+        await expect(op.handler(ctx(), {
+          ...params, grace_waiver_receipt_path: symlinkPath,
+        })).rejects.toThrow('regular file');
+
+        const oversized = Buffer.alloc(64 * 1024 + 1, 0x20);
+        await writeFile(waiver.grace_waiver_receipt_path, oversized, { mode: 0o600 });
+        await chmod(waiver.grace_waiver_receipt_path, 0o600);
+        await expect(op.handler(ctx(), {
+          ...params,
+          grace_waiver_receipt_sha256: createHash('sha256').update(oversized).digest('hex'),
+        })).rejects.toThrow('exceeds maximum size');
+
+        const malformed = '{}';
+        await writeFile(waiver.grace_waiver_receipt_path, malformed, { mode: 0o600 });
+        await chmod(waiver.grace_waiver_receipt_path, 0o600);
+        await expect(op.handler(ctx(), {
+          ...params,
+          grace_waiver_receipt_sha256: createHash('sha256').update(malformed).digest('hex'),
+        })).rejects.toThrow('schema mismatch');
+
+        const invalidUtf8 = Buffer.from([0xff]);
+        await writeFile(waiver.grace_waiver_receipt_path, invalidUtf8, { mode: 0o600 });
+        await chmod(waiver.grace_waiver_receipt_path, 0o600);
+        await expect(op.handler(ctx(), {
+          ...params,
+          grace_waiver_receipt_sha256: createHash('sha256').update(invalidUtf8).digest('hex'),
+        })).rejects.toThrow('UTF-8 JSON');
+
+        const replacement = await writeGraceWaiver(home, 'grace-waiver-rejections', entries);
+        await expect(op.handler(ctx(), { ...params, run_id: 'grace-waiver-wrong-run', ...replacement })).rejects.toThrow('does not bind');
+        await expect(op.handler({ ...ctx(), sourceId: 'other' }, { ...params, ...replacement })).rejects.toThrow('does not bind');
+        await expect(op.handler(ctx(), {
+          ...params,
+          allowlist: [{ ...entries[0], content_hash: '0'.repeat(64) }],
+          ...replacement,
+        })).rejects.toThrow('does not bind');
+      });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test('blocks a future tombstone even with a valid age-zero grace waiver', async () => {
+    const op = operationsByName.purge_pages_exact;
+    const page = await seedPurgePage('archive/grace-waiver-future', 'future body', 0);
+    await engine.executeRaw(`UPDATE pages SET deleted_at = now() + interval '1 hour' WHERE id = $1::int`, [page.id]);
+    const futurePage = (await engine.getPage(page.slug, { sourceId: 'default', includeDeleted: true }))!;
+    const entries = [entry(futurePage)];
+    const home = await mkdtemp(join(tmpdir(), 'gbrain-purge-grace-waiver-future-home-'));
+    try {
+      await withEnv({ GBRAIN_HOME: home }, async () => {
+        const waiver = await writeGraceWaiver(home, 'grace-waiver-future', entries);
+        await expect(op.handler(ctx(), {
+          action: 'plan', run_id: 'grace-waiver-future', allowlist: entries, ...waiver,
+        })).rejects.toThrow('younger than 0 days');
       });
     } finally {
       await rm(home, { recursive: true, force: true });
