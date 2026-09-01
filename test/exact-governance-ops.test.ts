@@ -912,6 +912,49 @@ describe('reindex_page_links_exact', () => {
     expect(after).toMatchObject({ current_owned_edge_count: 0, would_create_count: 0, would_remove_count: 0, exact_match: true });
   });
 
+  test('removes the exact stale preimage before adding a replacement with the same storage identity', async () => {
+    const op = operationsByName.reindex_page_links_exact;
+    const origin = 'memphis/audits/exact-replacement-hub';
+    const target = 'memphis/audits/exact-replacement-target';
+    await engine.putPage(target, {
+      type: 'note', title: 'Replacement target', compiled_truth: 'target', timeline: '', frontmatter: {},
+    });
+    await engine.putPage(origin, {
+      type: 'note', title: 'Replacement hub', compiled_truth: 'body', timeline: '',
+      frontmatter: { related: [`[[${target}]]`] },
+    });
+    await engine.addLink(
+      origin, target, 'stale context', 'related_to', 'frontmatter', origin, 'related',
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    const page = (await engine.getPage(origin))!;
+    const params = {
+      slug: origin,
+      expected_content_hash: page.content_hash,
+      expected_markdown_sha256: await renderedMarkdownSha256(origin),
+    };
+
+    const before = await operationsByName.plan_reindex_page_links_exact.handler(ctx(), params) as any;
+    expect(before).toMatchObject({
+      current_owned_edge_count: 1, expected_owned_edge_count: 1,
+      would_create_count: 1, would_remove_count: 1, exact_match: false,
+    });
+
+    await expect(op.handler(ctx(), params)).resolves.toMatchObject({ status: 'reindexed', created: 1, removed: 1 });
+
+    const links = await engine.getLinks(origin, { sourceId: 'default' });
+    expect(links).toEqual([expect.objectContaining({
+      to_slug: target,
+      link_type: 'related_to',
+      link_source: 'frontmatter',
+      origin_slug: origin,
+      origin_field: 'related',
+      context: `frontmatter.related: [[${target}]]`,
+    })]);
+    const after = await operationsByName.plan_reindex_page_links_exact.handler(ctx(), params) as any;
+    expect(after).toMatchObject({ would_create_count: 0, would_remove_count: 0, exact_match: true });
+  });
+
   test('preserves a foreign-provenance incoming sibling during exact cleanup', async () => {
     const op = operationsByName.reindex_page_links_exact;
     const origin = 'memphis/audits/incoming-hub';

@@ -25,7 +25,7 @@ import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from './eval-capture.ts';
 import type { HybridSearchMeta } from './types.ts';
-import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from './link-extraction.ts';
+import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type LinkCandidate, type UnresolvedFrontmatterRef } from './link-extraction.ts';
 import { isFactsBackstopEligible } from './facts/eligibility.ts';
 import { stripTakesFence } from './takes-fence.ts';
 import { stripFactsFence } from './facts-fence.ts';
@@ -1478,38 +1478,11 @@ function normalizedExactLink(link: import('./types.ts').Link): ExactLinkIdentity
   };
 }
 
-async function planExactLinkProjection(
-  engine: BrainEngine,
+function expectedExactProjectionEdges(
   slug: string,
-  parsed: { type: PageType; compiled_truth: string; timeline: string; frontmatter: Record<string, unknown> },
-  sourceId: string,
-): Promise<Record<string, unknown>> {
-  const resolver = makeResolver(engine, { mode: 'batch', sourceId });
-  const globalBasename = await isGlobalBasenameEnabled(engine);
-  const extracted = await extractPageLinks(
-    slug,
-    `${parsed.compiled_truth}\n${parsed.timeline}`,
-    parsed.frontmatter,
-    parsed.type,
-    resolver,
-    { globalBasename },
-  );
-  if (extracted.unresolved.length > 0) {
-    return {
-      status: 'blocked',
-      slug,
-      reason: 'unresolved_frontmatter',
-      unresolved_reference_count: extracted.unresolved.length,
-    };
-  }
-  const sourceOpts = { sourceId };
-  const allSlugs = await engine.getAllSlugs(sourceOpts);
-  const valid = extracted.candidates.filter((candidate) =>
-    allSlugs.has(candidate.targetSlug) && (!candidate.fromSlug || allSlugs.has(candidate.fromSlug))
-  );
-  const outgoing = valid.filter((candidate) => !candidate.fromSlug || candidate.fromSlug === slug);
-  const incoming = valid.filter((candidate) => candidate.fromSlug && candidate.fromSlug !== slug);
-
+  outgoing: LinkCandidate[],
+  incoming: LinkCandidate[],
+): ExactLinkIdentity[] {
   const expectedByStorageIdentity = new Map<string, ExactLinkIdentity>();
   const remember = (edge: ExactLinkIdentity) => {
     const storageIdentity = JSON.stringify([
@@ -1541,7 +1514,41 @@ async function planExactLinkProjection(
       resolution_type: null,
     });
   }
-  const expected = [...expectedByStorageIdentity.values()];
+  return [...expectedByStorageIdentity.values()];
+}
+
+async function planExactLinkProjection(
+  engine: BrainEngine,
+  slug: string,
+  parsed: { type: PageType; compiled_truth: string; timeline: string; frontmatter: Record<string, unknown> },
+  sourceId: string,
+): Promise<Record<string, unknown>> {
+  const resolver = makeResolver(engine, { mode: 'batch', sourceId });
+  const globalBasename = await isGlobalBasenameEnabled(engine);
+  const extracted = await extractPageLinks(
+    slug,
+    `${parsed.compiled_truth}\n${parsed.timeline}`,
+    parsed.frontmatter,
+    parsed.type,
+    resolver,
+    { globalBasename },
+  );
+  if (extracted.unresolved.length > 0) {
+    return {
+      status: 'blocked',
+      slug,
+      reason: 'unresolved_frontmatter',
+      unresolved_reference_count: extracted.unresolved.length,
+    };
+  }
+  const sourceOpts = { sourceId };
+  const allSlugs = await engine.getAllSlugs(sourceOpts);
+  const valid = extracted.candidates.filter((candidate) =>
+    allSlugs.has(candidate.targetSlug) && (!candidate.fromSlug || allSlugs.has(candidate.fromSlug))
+  );
+  const outgoing = valid.filter((candidate) => !candidate.fromSlug || candidate.fromSlug === slug);
+  const incoming = valid.filter((candidate) => candidate.fromSlug && candidate.fromSlug !== slug);
+  const expected = expectedExactProjectionEdges(slug, outgoing, incoming);
 
   const existingOut = await engine.getLinks(slug, sourceOpts);
   const existingIn = (await engine.getBacklinks(slug, sourceOpts)).filter(
@@ -1756,6 +1763,39 @@ async function runAutoLink(
            (l.link_source === 'frontmatter' && l.origin_slug === slug),
     );
 
+    if (opts?.exactGate) {
+      const expected = expectedExactProjectionEdges(slug, out, inc);
+      const currentByExactIdentity = new Map<string, ExactLinkIdentity>();
+      for (const edge of [...reconcilableOut, ...existingIn].map(normalizedExactLink)) {
+        currentByExactIdentity.set(exactProjectionEdgeKey(edge), edge);
+      }
+      const current = [...currentByExactIdentity.values()];
+      const expectedKeys = new Set(expected.map(exactProjectionEdgeKey));
+      const currentKeys = new Set(current.map(exactProjectionEdgeKey));
+      const stale = current.filter((edge) => !expectedKeys.has(exactProjectionEdgeKey(edge)));
+      const missing = expected.filter((edge) => !currentKeys.has(exactProjectionEdgeKey(edge)));
+
+      // Remove exact preimages first. Adding a replacement with the same storage
+      // identity can update context/provenance fields in place, which would make
+      // the old exact identity disappear before its deletion is journaled.
+      for (const edge of stale) {
+        await tx.removeLinkExact(edge, { sourceId: opts.sourceId ?? 'default' });
+      }
+      for (const edge of missing) {
+        await tx.addLink(
+          edge.from_slug,
+          edge.to_slug,
+          edge.context,
+          edge.link_type,
+          edge.link_source ?? undefined,
+          edge.origin_slug ?? undefined,
+          edge.origin_field ?? undefined,
+          { ...linkSourceOpts, resolutionType: edge.resolution_type ?? undefined },
+        );
+      }
+      return { created: missing.length, removed: stale.length, errors: 0 };
+    }
+
     const outKeys = new Set(out.map(c =>
       `${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? 'markdown'}`
     ));
@@ -1808,14 +1848,7 @@ async function runAutoLink(
       const key = `${l.to_slug}\u0000${l.link_type}\u0000${l.link_source ?? 'markdown'}`;
       if (!outKeys.has(key)) {
         try {
-          // Exact reindex must not widen a stale managed deletion to a sibling
-          // edge with the same endpoints/type/source but different provenance.
-          // The legacy removal API intentionally has coarse semantics.
-          if (opts?.exactGate) {
-            await tx.removeLinkExact(normalizedExactLink(l), { sourceId: opts.sourceId ?? 'default' });
-          } else {
-            await tx.removeLink(slug, l.to_slug, l.link_type, l.link_source ?? undefined, removeSourceOpts);
-          }
+          await tx.removeLink(slug, l.to_slug, l.link_type, l.link_source ?? undefined, removeSourceOpts);
           removed++;
         } catch (error) {
           if (opts?.strict) throw error;
@@ -1829,11 +1862,7 @@ async function runAutoLink(
       const key = `${l.from_slug}\u0000${l.link_type}`;
       if (!incKeys.has(key)) {
         try {
-          if (opts?.exactGate) {
-            await tx.removeLinkExact(normalizedExactLink(l), { sourceId: opts.sourceId ?? 'default' });
-          } else {
-            await tx.removeLink(l.from_slug, slug, l.link_type, 'frontmatter', removeSourceOpts);
-          }
+          await tx.removeLink(l.from_slug, slug, l.link_type, 'frontmatter', removeSourceOpts);
           removed++;
         } catch (error) {
           if (opts?.strict) throw error;
