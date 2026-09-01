@@ -656,6 +656,56 @@ describe('put_page_file_exact', () => {
 });
 
 describe('reindex_page_links_exact', () => {
+  test('plans the exact managed projection read-only and proves the post-reindex fixed point', async () => {
+    const planner = operationsByName.plan_reindex_page_links_exact;
+    const reindex = operationsByName.reindex_page_links_exact;
+    expect(planner.localOnly).toBe(true);
+    expect(planner.scope).toBe('admin');
+    expect(planner.mutating).toBe(false);
+    const origin = 'projects/reindex-plan-origin';
+    const target = 'projects/reindex-plan-target';
+    const stale = 'projects/reindex-plan-stale';
+    await engine.putPage(target, { type: 'note', title: 'Target', compiled_truth: 'target private body', timeline: '', frontmatter: {} });
+    await engine.putPage(stale, { type: 'note', title: 'Stale', compiled_truth: 'stale private body', timeline: '', frontmatter: {} });
+    await engine.putPage(origin, {
+      type: 'note', title: 'Origin', compiled_truth: `origin private body [[${target}]]`, timeline: '', frontmatter: {},
+    });
+    await engine.addLink(origin, stale, 'stale managed context', 'related_to', 'markdown');
+    await engine.addLink(origin, stale, 'manual sibling context', 'related', 'manual');
+    const page = (await engine.getPage(origin))!;
+    const params = {
+      slug: origin,
+      expected_content_hash: page.content_hash,
+      expected_markdown_sha256: await renderedMarkdownSha256(origin),
+    };
+    const countsBefore = await counts();
+
+    const before = await planner.handler(ctx(), params) as any;
+    expect(before).toMatchObject({
+      status: 'planned', slug: origin, expected_owned_edge_count: 1,
+      current_owned_edge_count: 1, would_create_count: 1, would_remove_count: 1,
+      exact_match: false,
+    });
+    expect(await counts()).toEqual(countsBefore);
+    expect(JSON.stringify(before)).not.toContain('private body');
+    expect(JSON.stringify(before)).not.toContain('context');
+
+    await reindex.handler(ctx(), params);
+    const after = await planner.handler(ctx(), params) as any;
+    expect(after).toMatchObject({
+      expected_owned_edge_count: 1, current_owned_edge_count: 1,
+      would_create_count: 0, would_remove_count: 0, exact_match: true,
+    });
+    expect(after.current_owned_fingerprint).toBe(after.expected_owned_fingerprint);
+    const links = await engine.getLinks(origin, { sourceId: 'default' });
+    expect(links).toEqual(expect.arrayContaining([expect.objectContaining({
+      to_slug: stale, link_source: 'manual', context: 'manual sibling context',
+    })]));
+
+    await expect(planner.handler({ ...ctx(), remote: true }, params)).rejects.toThrow('local-only');
+    await expect(planner.handler(ctx(), { ...params, expected_content_hash: '0'.repeat(64) })).rejects.toThrow('preimage hash drift');
+  });
+
   test('indexes an exact wikilink in a custom namespace without rewriting the page', async () => {
     const op = operationsByName.reindex_page_links_exact;
     const origin = 'codex/checkpoints/sprint-2';

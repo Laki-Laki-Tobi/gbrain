@@ -158,6 +158,7 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
       'inventory_deleted_pages_exact',
       'inventory_soft_delete_candidates_exact',
       'inventory_soft_delete_backlinks_exact',
+      'plan_reindex_page_links_exact',
       'purge_pages_exact',
       'purge_deleted_pages',
       'get_recent_transcripts',

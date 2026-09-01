@@ -35,6 +35,7 @@ import { isSearchMode } from './search/mode.ts';
 import { normalizeAliasList } from './search/alias-normalize.ts';
 import { stampEvidence } from './search/evidence.ts';
 import type { SearchResult } from './types.ts';
+import { sanitizeForJsonb } from './batch-rows.ts';
 import { CJK_SLUG_CHARS } from './cjk.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
@@ -1450,6 +1451,168 @@ const reindex_page_links_exact: Operation = {
     });
     return { status: 'reindexed', slug, content_hash: expectedContentHash, created: result.created, removed: result.removed };
   },
+};
+
+function exactProjectionEdgeKey(edge: ExactLinkIdentity): string {
+  return JSON.stringify([
+    edge.from_slug, edge.to_slug, edge.link_type, edge.context, edge.link_source,
+    edge.origin_slug, edge.origin_field, edge.resolution_type,
+  ]);
+}
+
+function exactProjectionFingerprint(edges: ExactLinkIdentity[]): string {
+  const keys = edges.map(exactProjectionEdgeKey).sort();
+  return createHash('sha256').update(JSON.stringify(keys)).digest('hex');
+}
+
+function normalizedExactLink(link: import('./types.ts').Link): ExactLinkIdentity {
+  return {
+    from_slug: link.from_slug,
+    to_slug: link.to_slug,
+    link_type: link.link_type,
+    context: link.context,
+    link_source: link.link_source ?? null,
+    origin_slug: link.origin_slug ?? null,
+    origin_field: link.origin_field ?? null,
+    resolution_type: link.resolution_type ?? null,
+  };
+}
+
+async function planExactLinkProjection(
+  engine: BrainEngine,
+  slug: string,
+  parsed: { type: PageType; compiled_truth: string; timeline: string; frontmatter: Record<string, unknown> },
+  sourceId: string,
+): Promise<Record<string, unknown>> {
+  const resolver = makeResolver(engine, { mode: 'batch', sourceId });
+  const globalBasename = await isGlobalBasenameEnabled(engine);
+  const extracted = await extractPageLinks(
+    slug,
+    `${parsed.compiled_truth}\n${parsed.timeline}`,
+    parsed.frontmatter,
+    parsed.type,
+    resolver,
+    { globalBasename },
+  );
+  if (extracted.unresolved.length > 0) {
+    throw new OperationError('storage_error', `exact link reindex plan has ${extracted.unresolved.length} unresolved frontmatter reference(s)`);
+  }
+  const sourceOpts = { sourceId };
+  const allSlugs = await engine.getAllSlugs(sourceOpts);
+  const valid = extracted.candidates.filter((candidate) =>
+    allSlugs.has(candidate.targetSlug) && (!candidate.fromSlug || allSlugs.has(candidate.fromSlug))
+  );
+  const outgoing = valid.filter((candidate) => !candidate.fromSlug || candidate.fromSlug === slug);
+  const incoming = valid.filter((candidate) => candidate.fromSlug && candidate.fromSlug !== slug);
+
+  const expectedByStorageIdentity = new Map<string, ExactLinkIdentity>();
+  const remember = (edge: ExactLinkIdentity) => {
+    const storageIdentity = JSON.stringify([
+      edge.from_slug, edge.to_slug, edge.link_type, edge.link_source, edge.origin_slug,
+    ]);
+    expectedByStorageIdentity.set(storageIdentity, edge);
+  };
+  for (const candidate of outgoing) {
+    remember({
+      from_slug: slug,
+      to_slug: candidate.targetSlug,
+      link_type: candidate.linkType || '',
+      context: sanitizeForJsonb(candidate.context || ''),
+      link_source: candidate.linkSource || 'markdown',
+      origin_slug: candidate.originSlug || null,
+      origin_field: candidate.originField || null,
+      resolution_type: null,
+    });
+  }
+  for (const candidate of incoming) {
+    remember({
+      from_slug: candidate.fromSlug!,
+      to_slug: candidate.targetSlug,
+      link_type: candidate.linkType || '',
+      context: sanitizeForJsonb(candidate.context || ''),
+      link_source: 'frontmatter',
+      origin_slug: candidate.originSlug || null,
+      origin_field: candidate.originField || null,
+      resolution_type: null,
+    });
+  }
+  const expected = [...expectedByStorageIdentity.values()];
+
+  const existingOut = await engine.getLinks(slug, sourceOpts);
+  const existingIn = (await engine.getBacklinks(slug, sourceOpts)).filter(
+    (link) => link.link_source === 'frontmatter' && link.origin_slug === slug,
+  );
+  const currentByExactIdentity = new Map<string, ExactLinkIdentity>();
+  for (const edge of [
+    ...existingOut.filter((link) =>
+      link.link_source === 'markdown' || link.link_source == null
+      || link.link_source === 'wikilink-resolved'
+      || (link.link_source === 'frontmatter' && link.origin_slug === slug)
+    ),
+    ...existingIn,
+  ].map(normalizedExactLink)) currentByExactIdentity.set(exactProjectionEdgeKey(edge), edge);
+  const current = [...currentByExactIdentity.values()];
+  const expectedKeys = new Set(expected.map(exactProjectionEdgeKey));
+  const currentKeys = new Set(current.map(exactProjectionEdgeKey));
+  return {
+    status: 'planned',
+    slug,
+    expected_owned_edge_count: expected.length,
+    current_owned_edge_count: current.length,
+    would_create_count: [...expectedKeys].filter((key) => !currentKeys.has(key)).length,
+    would_remove_count: [...currentKeys].filter((key) => !expectedKeys.has(key)).length,
+    expected_owned_fingerprint: exactProjectionFingerprint(expected),
+    current_owned_fingerprint: exactProjectionFingerprint(current),
+    exact_match: expectedKeys.size === currentKeys.size && [...expectedKeys].every((key) => currentKeys.has(key)),
+  };
+}
+
+const plan_reindex_page_links_exact: Operation = {
+  name: 'plan_reindex_page_links_exact',
+  description: 'Local-admin read-only exact managed-link projection plan without returning page or link content.',
+  params: {
+    slug: { type: 'string', required: true },
+    expected_content_hash: { type: 'string', required: true },
+    expected_markdown_sha256: { type: 'string', required: true },
+  },
+  mutating: false,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError('permission_denied', 'plan_reindex_page_links_exact is local-only and must be called through the local CLI.');
+    }
+    const slug = requireLowercaseExactSlug(p.slug);
+    const expectedContentHash = requireExactString(p, 'expected_content_hash');
+    const expectedMarkdownSha256 = requireExactString(p, 'expected_markdown_sha256');
+    if (!/^[a-f0-9]{64}$/.test(expectedContentHash) || !/^[a-f0-9]{64}$/.test(expectedMarkdownSha256)) {
+      throw new OperationError('invalid_params', 'expected hashes must be lowercase sha256 hex');
+    }
+    const sourceId = ctx.sourceId || 'default';
+    return ctx.engine.transaction(async (tx) => {
+      try {
+        await tx.executeRaw(`SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, [`auto_link:${slug}`]);
+      } catch {
+        // PGLite is single-process and does not need the cross-process lock.
+      }
+      const page = await tx.getPage(slug, { sourceId, includeDeleted: true });
+      if (!page || page.deleted_at || page.content_hash !== expectedContentHash) {
+        throw new OperationError('storage_error', `plan_reindex_page_links_exact preimage hash drift for ${slug}`);
+      }
+      const tags = await tx.getTags(slug, { sourceId });
+      const markdownSha256 = createHash('sha256').update(serializePageToMarkdown(page, tags)).digest('hex');
+      if (markdownSha256 !== expectedMarkdownSha256) {
+        throw new OperationError('storage_error', `plan_reindex_page_links_exact markdown drift for ${slug}`);
+      }
+      return planExactLinkProjection(tx, slug, {
+        type: page.type,
+        compiled_truth: page.compiled_truth,
+        timeline: page.timeline || '',
+        frontmatter: page.frontmatter || {},
+      }, sourceId);
+    });
+  },
+  cliHints: { name: 'plan-reindex-page-links-exact' },
 };
 
 // v0.31.2: isFactsBackstopEligible moved to src/core/facts/eligibility.ts
@@ -6482,7 +6645,7 @@ const chronicle_backfill: Operation = {
 
 export const operations: Operation[] = [
   // Page CRUD
-  get_page, put_page, create_page_file_exact, put_page_file_exact, reindex_page_links_exact, patch_page_metadata_exact,
+  get_page, put_page, create_page_file_exact, put_page_file_exact, reindex_page_links_exact, plan_reindex_page_links_exact, patch_page_metadata_exact,
   soft_delete_page_exact, delete_page, list_pages,
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)
   restore_page_exact, restore_page, purge_pages_exact, inventory_deleted_pages_exact,
