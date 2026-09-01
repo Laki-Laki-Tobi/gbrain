@@ -9,6 +9,7 @@ import { parseMarkdown, serializePageToMarkdown } from '../src/core/markdown.ts'
 import { operationsByName, type OperationContext } from '../src/core/operations.ts';
 import {
   inventoryDeletedPagesExact,
+  inventorySoftDeleteBacklinksExact,
   inventorySoftDeleteCandidatesExact,
 } from '../src/core/exact-corpus-remediation.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -1962,5 +1963,147 @@ describe('inventory_soft_delete_candidates_exact', () => {
       sourceId: 'default',
       entries: [{ slug: 'archive/invalid-count', expectedRawMarkdownSha256: 'a'.repeat(64) }],
     })).rejects.toThrow('inventory inbound count is invalid');
+  });
+});
+
+describe('inventory_soft_delete_backlinks_exact', () => {
+  test('is local-only, admin-scoped, and read-only', async () => {
+    const op = operationsByName.inventory_soft_delete_backlinks_exact;
+    expect(op.localOnly).toBe(true);
+    expect(op.scope).toBe('admin');
+    expect(op.mutating).toBe(false);
+    const explodingEngine = new Proxy({} as PGLiteEngine, { get() { throw new Error('engine must not be touched'); } });
+    await expect(op.handler({ ...ctx(), engine: explodingEngine, remote: true }, {
+      slugs: ['archive/reviewed'],
+    })).rejects.toThrow('local-only');
+  });
+
+  test('returns exact provenance and endpoint state without page bodies', async () => {
+    const op = operationsByName.inventory_soft_delete_backlinks_exact;
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+      ['backlink-other'],
+    );
+    for (const [slug, body] of [
+      ['archive/backlink-target', 'target private body'],
+      ['archive/backlink-empty', 'empty target private body'],
+      ['archive/backlink-deleted', 'deleted target private body'],
+      ['projects/backlink-local', 'local referrer private body'],
+      ['projects/backlink-origin', 'origin private body'],
+    ]) {
+      await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: body, timeline: '', frontmatter: {} });
+    }
+    await engine.putPage('projects/backlink-foreign', {
+      type: 'note', title: 'Foreign', compiled_truth: 'foreign referrer private body', timeline: '', frontmatter: {},
+    }, { sourceId: 'backlink-other' });
+    await engine.putPage('projects/backlink-foreign-origin', {
+      type: 'note', title: 'Foreign origin', compiled_truth: 'foreign origin private body', timeline: '', frontmatter: {},
+    }, { sourceId: 'backlink-other' });
+    await engine.addLink('projects/backlink-local', 'archive/backlink-target', 'manual context', 'related', 'manual');
+    await engine.addLink(
+      'projects/backlink-local', 'archive/backlink-target', 'frontmatter context', 'related',
+      'frontmatter', 'projects/backlink-origin', 'related',
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default', resolutionType: 'qualified' },
+    );
+    await engine.addLink(
+      'projects/backlink-foreign', 'archive/backlink-target', 'foreign context', 'related', 'manual',
+      undefined, undefined, { fromSourceId: 'backlink-other', toSourceId: 'default' },
+    );
+    await engine.addLink(
+      'projects/backlink-local', 'archive/backlink-target', 'foreign origin context', 'related',
+      'frontmatter', 'projects/backlink-foreign-origin', 'related',
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'backlink-other', resolutionType: 'unqualified' },
+    );
+    await engine.executeRaw(`UPDATE links SET link_kind = 'typed_ner' WHERE context = 'manual context'`);
+    await engine.executeRaw(
+      `UPDATE pages SET deleted_at = now()
+        WHERE source_id = 'default' AND slug IN ('archive/backlink-deleted', 'projects/backlink-local')`,
+    );
+
+    const result = await op.handler(ctx(), { slugs: [
+      'archive/backlink-target', 'archive/backlink-empty',
+      'archive/backlink-deleted', 'archive/backlink-missing',
+    ] }) as any;
+
+    expect(result.targets).toEqual([
+      { slug: 'archive/backlink-deleted', state: 'soft_deleted', edge_count: 0 },
+      { slug: 'archive/backlink-empty', state: 'active', edge_count: 0 },
+      { slug: 'archive/backlink-missing', state: 'missing', edge_count: 0 },
+      { slug: 'archive/backlink-target', state: 'active', edge_count: 4 },
+    ]);
+    expect(result.counts).toEqual({
+      requested: 4, active_targets: 2, soft_deleted_targets: 1, missing_targets: 1,
+      edges: 4, source_local_edges: 2, cross_source_edges: 2,
+    });
+    expect(result.edges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        from_slug: 'projects/backlink-local', to_slug: 'archive/backlink-target',
+        context: 'manual context', link_source: 'manual', origin_slug: null,
+        link_kind: 'typed_ner',
+        from_source_id: 'default', to_source_id: 'default', origin_source_id: null,
+        from_state: 'soft_deleted', to_state: 'active', origin_state: null, source_local: true,
+      }),
+      expect.objectContaining({
+        context: 'frontmatter context', link_source: 'frontmatter',
+        origin_slug: 'projects/backlink-origin', origin_field: 'related', resolution_type: 'qualified',
+        origin_source_id: 'default', origin_state: 'active', source_local: true,
+      }),
+      expect.objectContaining({
+        from_slug: 'projects/backlink-foreign', context: 'foreign context',
+        from_source_id: 'backlink-other', source_local: false,
+      }),
+      expect.objectContaining({
+        context: 'foreign origin context', link_kind: null,
+        origin_slug: 'projects/backlink-foreign-origin', origin_source_id: 'backlink-other',
+        origin_state: 'active', source_local: false,
+      }),
+    ]));
+    expect(typeof result.fingerprint).toBe('string');
+    const encoded = JSON.stringify(result);
+    for (const body of [
+      'target private body', 'empty target private body', 'deleted target private body',
+      'local referrer private body', 'origin private body', 'foreign referrer private body',
+      'foreign origin private body',
+    ]) expect(encoded).not.toContain(body);
+  });
+
+  test('accepts legacy exact slugs, rejects invalid input, and fails closed on malformed rows', async () => {
+    const op = operationsByName.inventory_soft_delete_backlinks_exact;
+    const legacy = await op.handler(ctx(), { slugs: ['archive/legacy_name.v1'] }) as any;
+    expect(legacy.targets).toEqual([{ slug: 'archive/legacy_name.v1', state: 'missing', edge_count: 0 }]);
+    await expect(op.handler(ctx(), { slugs: [] })).rejects.toThrow('between 1 and 500');
+    await expect(op.handler(ctx(), { slugs: ['Archive/Upper'] })).rejects.toThrow('lowercase');
+    await expect(op.handler(ctx(), { slugs: ['archive/a', 'archive/a'] })).rejects.toThrow('duplicate');
+
+    await expect(inventorySoftDeleteBacklinksExact({
+      executeRaw: async () => [{
+        requested_slug: 'archive/malformed', target_id: 1, target_deleted_at: null,
+        link_id: 1, from_slug: null, to_slug: 'archive/malformed', link_type: 'related',
+        context: '', link_source: 'manual', origin_slug: null, origin_field: null,
+        link_kind: null, resolution_type: null, from_source_id: null, to_source_id: 'default',
+        origin_source_id: null, from_deleted_at: null, to_deleted_at: null, origin_deleted_at: null,
+      }],
+    } as any, { sourceId: 'default', slugs: ['archive/malformed'] })).rejects.toThrow('exact identity is incomplete');
+  });
+
+  test('normalizes engine row order before computing the fingerprint', async () => {
+    const base = {
+      target_id: 1, target_deleted_at: null, link_id: 1,
+      to_slug: 'archive/order-target', link_type: 'related', link_source: 'manual', link_kind: null,
+      origin_slug: null, origin_field: null, resolution_type: null,
+      from_source_id: 'default', to_source_id: 'default', origin_source_id: null,
+      from_deleted_at: null, to_deleted_at: null, origin_deleted_at: null,
+    };
+    const rows = [
+      { ...base, requested_slug: 'archive/order-target', from_slug: 'projects/zeta', context: 'Z' },
+      { ...base, link_id: 2, requested_slug: 'archive/order-target', from_slug: 'projects/alpha', context: 'Ä' },
+    ];
+    const run = (orderedRows: typeof rows) => inventorySoftDeleteBacklinksExact({
+      executeRaw: async () => orderedRows,
+    } as any, { sourceId: 'default', slugs: ['archive/order-target'] }) as Promise<any>;
+    const forward = await run(rows);
+    const reverse = await run([...rows].reverse());
+    expect(reverse.edges).toEqual(forward.edges);
+    expect(reverse.fingerprint).toBe(forward.fingerprint);
   });
 });
