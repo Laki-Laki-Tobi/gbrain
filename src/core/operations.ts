@@ -1808,7 +1808,14 @@ async function runAutoLink(
       const key = `${l.to_slug}\u0000${l.link_type}\u0000${l.link_source ?? 'markdown'}`;
       if (!outKeys.has(key)) {
         try {
-          await tx.removeLink(slug, l.to_slug, l.link_type, l.link_source ?? undefined, removeSourceOpts);
+          // Exact reindex must not widen a stale managed deletion to a sibling
+          // edge with the same endpoints/type/source but different provenance.
+          // The legacy removal API intentionally has coarse semantics.
+          if (opts?.exactGate) {
+            await tx.removeLinkExact(normalizedExactLink(l), { sourceId: opts.sourceId ?? 'default' });
+          } else {
+            await tx.removeLink(slug, l.to_slug, l.link_type, l.link_source ?? undefined, removeSourceOpts);
+          }
           removed++;
         } catch (error) {
           if (opts?.strict) throw error;
@@ -1822,7 +1829,11 @@ async function runAutoLink(
       const key = `${l.from_slug}\u0000${l.link_type}`;
       if (!incKeys.has(key)) {
         try {
-          await tx.removeLink(l.from_slug, slug, l.link_type, 'frontmatter', removeSourceOpts);
+          if (opts?.exactGate) {
+            await tx.removeLinkExact(normalizedExactLink(l), { sourceId: opts.sourceId ?? 'default' });
+          } else {
+            await tx.removeLink(l.from_slug, slug, l.link_type, 'frontmatter', removeSourceOpts);
+          }
           removed++;
         } catch (error) {
           if (opts?.strict) throw error;

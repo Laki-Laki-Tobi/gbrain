@@ -822,6 +822,140 @@ describe('reindex_page_links_exact', () => {
     expect(JSON.stringify(result)).not.toContain('source body');
   });
 
+  test('removes only the exact stale managed edge when a sibling shares its endpoints, type, and source', async () => {
+    const op = operationsByName.reindex_page_links_exact;
+    const origin = 'memphis/audits/hub';
+    const target = 'memphis/audits/retired-target';
+    const foreignProvenance = 'memphis/audits/import-provenance';
+    await engine.putPage(target, {
+      type: 'note', title: 'Retired target', compiled_truth: 'target', timeline: '', frontmatter: {},
+    });
+    await engine.putPage(foreignProvenance, {
+      type: 'note', title: 'Imported provenance', compiled_truth: 'provenance', timeline: '', frontmatter: {},
+    });
+    await engine.putPage(origin, {
+      type: 'note', title: 'Audit hub', compiled_truth: 'No managed link remains.', timeline: '', frontmatter: {},
+    });
+    await engine.addLink(
+      origin, target, 'stale managed relation', 'related_to', 'frontmatter', origin, 'related',
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    await engine.addLink(
+      origin, target, 'unmanaged imported relation', 'related_to', 'frontmatter', foreignProvenance, 'imported_related',
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    const page = (await engine.getPage(origin))!;
+    const params = {
+      slug: origin,
+      expected_content_hash: page.content_hash,
+      expected_markdown_sha256: await renderedMarkdownSha256(origin),
+    };
+
+    const before = await operationsByName.plan_reindex_page_links_exact.handler(ctx(), params) as any;
+    expect(before).toMatchObject({ current_owned_edge_count: 1, would_remove_count: 1 });
+
+    await expect(op.handler(ctx(), params)).resolves.toMatchObject({ status: 'reindexed', removed: 1 });
+
+    const links = await engine.getLinks(origin, { sourceId: 'default' });
+    expect(links).toEqual([expect.objectContaining({
+      to_slug: target,
+      link_type: 'related_to',
+      link_source: 'frontmatter',
+      context: 'unmanaged imported relation',
+      origin_slug: foreignProvenance,
+      origin_field: 'imported_related',
+    })]);
+    const after = await operationsByName.plan_reindex_page_links_exact.handler(ctx(), params) as any;
+    expect(after).toMatchObject({ current_owned_edge_count: 0, would_create_count: 0, would_remove_count: 0, exact_match: true });
+  });
+
+  test('preserves a manual sibling when the stale managed edge has null link_source', async () => {
+    const op = operationsByName.reindex_page_links_exact;
+    const origin = 'memphis/audits/null-source-hub';
+    const target = 'memphis/audits/null-source-target';
+    await engine.putPage(target, {
+      type: 'note', title: 'Null source target', compiled_truth: 'target', timeline: '', frontmatter: {},
+    });
+    await engine.putPage(origin, {
+      type: 'note', title: 'Null source hub', compiled_truth: 'No managed link remains.', timeline: '', frontmatter: {},
+    });
+    const originPage = (await engine.getPage(origin))!;
+    const targetPage = (await engine.getPage(target))!;
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+       VALUES ($1::int, $2::int, 'governance_audit_report', 'stale legacy managed relation', NULL)`,
+      [originPage.id, targetPage.id],
+    );
+    await engine.addLink(
+      origin, target, 'manual audit relation', 'governance_audit_report', 'manual', undefined, undefined,
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    const params = {
+      slug: origin,
+      expected_content_hash: originPage.content_hash,
+      expected_markdown_sha256: await renderedMarkdownSha256(origin),
+    };
+
+    const before = await operationsByName.plan_reindex_page_links_exact.handler(ctx(), params) as any;
+    expect(before).toMatchObject({ current_owned_edge_count: 1, would_remove_count: 1 });
+
+    await expect(op.handler(ctx(), params)).resolves.toMatchObject({ status: 'reindexed', removed: 1 });
+
+    const links = await engine.getLinks(origin, { sourceId: 'default' });
+    expect(links).toEqual([expect.objectContaining({
+      to_slug: target,
+      link_type: 'governance_audit_report',
+      link_source: 'manual',
+      context: 'manual audit relation',
+    })]);
+    const after = await operationsByName.plan_reindex_page_links_exact.handler(ctx(), params) as any;
+    expect(after).toMatchObject({ current_owned_edge_count: 0, would_create_count: 0, would_remove_count: 0, exact_match: true });
+  });
+
+  test('preserves a foreign-provenance incoming sibling during exact cleanup', async () => {
+    const op = operationsByName.reindex_page_links_exact;
+    const origin = 'memphis/audits/incoming-hub';
+    const person = 'people/audit-person';
+    const foreignProvenance = 'memphis/audits/imported-company';
+    await engine.putPage(person, {
+      type: 'person', title: 'Audit person', compiled_truth: 'person', timeline: '', frontmatter: {},
+    });
+    await engine.putPage(foreignProvenance, {
+      type: 'company', title: 'Imported company', compiled_truth: 'provenance', timeline: '', frontmatter: {},
+    });
+    await engine.putPage(origin, {
+      type: 'company', title: 'Incoming audit hub', compiled_truth: 'No managed people remain.', timeline: '', frontmatter: {},
+    });
+    await engine.addLink(
+      person, origin, 'stale managed person', 'works_at', 'frontmatter', origin, 'key_people',
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    await engine.addLink(
+      person, origin, 'unmanaged imported person', 'works_at', 'frontmatter', foreignProvenance, 'key_people',
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    const page = (await engine.getPage(origin))!;
+    const params = {
+      slug: origin,
+      expected_content_hash: page.content_hash,
+      expected_markdown_sha256: await renderedMarkdownSha256(origin),
+    };
+
+    await expect(op.handler(ctx(), params)).resolves.toMatchObject({ status: 'reindexed', removed: 1 });
+
+    const links = await engine.getBacklinks(origin, { sourceId: 'default' });
+    expect(links).toEqual([expect.objectContaining({
+      from_slug: person,
+      link_type: 'works_at',
+      link_source: 'frontmatter',
+      context: 'unmanaged imported person',
+      origin_slug: foreignProvenance,
+      origin_field: 'key_people',
+    })]);
+    const after = await operationsByName.plan_reindex_page_links_exact.handler(ctx(), params) as any;
+    expect(after).toMatchObject({ current_owned_edge_count: 0, would_create_count: 0, would_remove_count: 0, exact_match: true });
+  });
+
   test('fails before mutation on remote, stale preimage, or unresolved frontmatter', async () => {
     const op = operationsByName.reindex_page_links_exact;
     const planner = operationsByName.plan_reindex_page_links_exact;
