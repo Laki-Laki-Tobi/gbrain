@@ -1932,6 +1932,12 @@ describe('inventory_soft_delete_candidates_exact', () => {
 
   test('validates exact reviewed input and fails closed on invalid inventory counts', async () => {
     const op = operationsByName.inventory_soft_delete_candidates_exact;
+    const legacy = await op.handler(ctx(), { entries: [{
+      slug: 'archive/legacy_name.v1', expected_raw_markdown_sha256: 'a'.repeat(64),
+    }] }) as any;
+    expect(legacy.rows[0]).toMatchObject({
+      slug: 'archive/legacy_name.v1', state: 'missing', reasons: ['PAGE_MISSING'],
+    });
     await expect(op.handler(ctx(), { entries: [] })).rejects.toThrow('between 1 and 500');
     await expect(op.handler(ctx(), { entries: [
       { slug: 'Archive/Upper', expected_raw_markdown_sha256: 'a'.repeat(64) },
