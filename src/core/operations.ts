@@ -3068,6 +3068,10 @@ const remove_links_exact_batch: Operation = {
   params: {
     edges: { type: 'array', required: true, items: { type: 'object' } },
     accept_absent: { type: 'boolean', description: 'Recovery-only: accept exact identities already absent at preflight.' },
+    require_from_soft_deleted_to_active: {
+      type: 'boolean',
+      description: 'Atomically require every source endpoint to remain soft-deleted and every target endpoint to remain active.',
+    },
   },
   mutating: true,
   scope: 'admin',
@@ -3105,6 +3109,7 @@ const remove_links_exact_batch: Operation = {
     }
     const sourceId = ctx.sourceId || 'default';
     const acceptAbsent = p.accept_absent === true;
+    const requireSoftDeletedSource = p.require_from_soft_deleted_to_active === true;
     const byFrom = new Map<string, ExactLinkIdentity[]>();
     for (const edge of edges) {
       const group = byFrom.get(edge.from_slug) || [];
@@ -3130,18 +3135,57 @@ const remove_links_exact_batch: Operation = {
         count: edges.length,
         preflight_present_count: preflightPresent.size,
         preflight_absent_count: preflightAbsent.size,
+        require_from_soft_deleted_to_active: requireSoftDeletedSource,
       };
     }
     let failureIndex: number | null = null;
     const successfulCalls = new Set<string>();
-    for (let index = 0; index < edges.length; index += 1) {
-      if (!preflightPresent.has(identities[index])) continue;
-      try {
-        await ctx.engine.removeLinkExact(edges[index], { sourceId });
-        successfulCalls.add(identities[index]);
-      } catch {
-        failureIndex = index;
-        break;
+    if (requireSoftDeletedSource) {
+      if (preflightAbsent.size > 0) {
+        throw new OperationError('storage_error', 'state-gated exact batch does not accept absent preimages');
+      }
+      await ctx.engine.transaction(async (tx) => {
+        const endpointSlugs = [...new Set(edges.flatMap((edge) => [edge.from_slug, edge.to_slug]))].sort();
+        const locked = await tx.executeRaw<{
+          source_id: string;
+          slug: string;
+          deleted_at: Date | string | null;
+        }>(`
+          SELECT source_id, slug, deleted_at
+            FROM pages
+           WHERE source_id = $1
+             AND slug IN (SELECT jsonb_array_elements_text($2::text::jsonb))
+           ORDER BY slug
+           FOR UPDATE
+        `, [sourceId, JSON.stringify(endpointSlugs)]);
+        const bySlug = new Map(locked.map((row) => [row.slug, row]));
+        if (locked.length !== endpointSlugs.length
+          || locked.some((row) => row.source_id !== sourceId)
+          || edges.some((edge) => !bySlug.get(edge.from_slug)?.deleted_at
+            || bySlug.get(edge.to_slug)?.deleted_at !== null)) {
+          throw new OperationError('storage_error', 'state-gated exact batch endpoint state changed');
+        }
+        for (const [fromSlug, group] of byFrom) {
+          const live = await tx.getLinks(fromSlug, { sourceIds: [sourceId], includeDeleted: true });
+          if (group.some((edge) => live.filter((link) => linkIdentityMatches(link, edge)).length !== 1)) {
+            throw new OperationError('storage_error', 'state-gated exact batch link preimage changed');
+          }
+        }
+        for (let index = 0; index < edges.length; index += 1) {
+          await tx.removeLinkExact(edges[index], { sourceId });
+          successfulCalls.add(identities[index]);
+        }
+      });
+    } else {
+      for (let index = 0; index < edges.length; index += 1) {
+        if (!preflightPresent.has(identities[index])) continue;
+        try {
+          await ctx.engine.removeLinkExact(edges[index], { sourceId });
+          successfulCalls.add(identities[index]);
+        } catch {
+          failureIndex = index;
+          break;
+        }
       }
     }
     const remaining = new Set<string>();

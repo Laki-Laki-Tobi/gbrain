@@ -1595,6 +1595,84 @@ describe('exact corpus page operations', () => {
     const links = await engine.getLinks(edge.from_slug, { includeDeleted: true });
     expect(links.some((link) => link.to_slug === target.slug && link.context === edge.context)).toBe(true);
   });
+
+  test('state-gated exact link batch only removes soft-deleted-source to active-target edges', async () => {
+    const from = 'projects/state-gated-source';
+    const to = 'projects/state-gated-target';
+    await engine.putPage(from, {
+      type: 'note', title: 'State-gated source', compiled_truth: 'source', timeline: '', frontmatter: {},
+    });
+    await engine.putPage(to, {
+      type: 'note', title: 'State-gated target', compiled_truth: 'target', timeline: '', frontmatter: {},
+    });
+    const edge = {
+      from, to, link_type: 'related', context: 'state-gated edge',
+      link_source: 'manual', origin_slug_is_null: true,
+      origin_field_is_null: true, resolution_type_is_null: true,
+    };
+    await engine.addLink(from, to, edge.context, edge.link_type, edge.link_source);
+
+    await expect(operationsByName.remove_links_exact_batch.handler(ctx(), {
+      edges: [edge], require_from_soft_deleted_to_active: true,
+    })).rejects.toThrow('endpoint state changed');
+    expect(await engine.getLinks(from, { sourceId: 'default' })).toHaveLength(1);
+
+    await engine.softDeletePage(from, { sourceId: 'default' });
+    await engine.softDeletePage(to, { sourceId: 'default' });
+    await expect(operationsByName.remove_links_exact_batch.handler(ctx(), {
+      edges: [edge], require_from_soft_deleted_to_active: true,
+    })).rejects.toThrow('endpoint state changed');
+    expect(await engine.getLinks(from, { sourceId: 'default', includeDeleted: true })).toHaveLength(1);
+    await engine.restorePage(to, { sourceId: 'default' });
+
+    const removed = await operationsByName.remove_links_exact_batch.handler(ctx(), {
+      edges: [edge], require_from_soft_deleted_to_active: true,
+    }) as any;
+    expect(removed).toMatchObject({
+      status: 'removed', count: 1, removed_count: 1, remaining_count: 0,
+      confirmed_removed_count: 1,
+    });
+    expect(await engine.getLinks(from, { sourceId: 'default', includeDeleted: true })).toEqual([]);
+  });
+
+  test('state-gated exact link batch rolls back every removal when one exact delete fails', async () => {
+    const from = 'projects/state-gated-atomic-source';
+    const targets = ['projects/state-gated-atomic-a', 'projects/state-gated-atomic-b'];
+    await engine.putPage(from, {
+      type: 'note', title: 'Atomic source', compiled_truth: 'source', timeline: '', frontmatter: {},
+    });
+    for (const target of targets) {
+      await engine.putPage(target, {
+        type: 'note', title: target, compiled_truth: 'target', timeline: '', frontmatter: {},
+      });
+      await engine.addLink(from, target, `edge to ${target}`, 'related', 'manual');
+    }
+    await engine.softDeletePage(from, { sourceId: 'default' });
+    const edges = targets.map((target) => ({
+      from, to: target, link_type: 'related', context: `edge to ${target}`,
+      link_source: 'manual', origin_slug_is_null: true,
+      origin_field_is_null: true, resolution_type_is_null: true,
+    }));
+    const originalTransaction = engine.transaction.bind(engine);
+    (engine as any).transaction = async (fn: any) => originalTransaction(async (tx) => {
+      const originalRemove = tx.removeLinkExact.bind(tx);
+      let calls = 0;
+      (tx as any).removeLinkExact = async (...args: any[]) => {
+        calls++;
+        if (calls === 2) throw new Error('injected state-gated removal failure');
+        return (originalRemove as any)(...args);
+      };
+      return fn(tx);
+    });
+    try {
+      await expect(operationsByName.remove_links_exact_batch.handler(ctx(), {
+        edges, require_from_soft_deleted_to_active: true,
+      })).rejects.toThrow('injected state-gated removal failure');
+    } finally {
+      delete (engine as any).transaction;
+    }
+    expect(await engine.getLinks(from, { sourceId: 'default', includeDeleted: true })).toHaveLength(2);
+  });
 });
 
 describe('purge_pages_exact', () => {
