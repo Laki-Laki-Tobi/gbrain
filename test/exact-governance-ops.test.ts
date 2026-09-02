@@ -1422,6 +1422,30 @@ describe('exact corpus page operations', () => {
     }) as any).recovered_after_ambiguous_commit).toBe(true);
   });
 
+  test('soft-delete accepts lowercase legacy exact slugs', async () => {
+    const slug = 'projects/legacy_exact.slug';
+    await engine.putPage(slug, {
+      type: 'note', title: 'Legacy exact slug', compiled_truth: 'legacy body', timeline: '', frontmatter: {},
+    });
+    const before = (await engine.getPage(slug))!;
+    const beforeMarkdownSha256 = await renderedMarkdownSha256(slug);
+
+    const deleted = await operationsByName.soft_delete_page_exact.handler(ctx(), {
+      slug,
+      expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: beforeMarkdownSha256,
+      require_zero_inbound: true,
+    }) as any;
+
+    expect(deleted.status).toBe('soft_deleted');
+    expect((await engine.getPage(slug, { includeDeleted: true }))?.deleted_at).toBeTruthy();
+    await expect(operationsByName.soft_delete_page_exact.handler(ctx(), {
+      slug: 'projects/Legacy_exact.slug',
+      expected_content_hash: before.content_hash,
+      expected_preimage_markdown_sha256: beforeMarkdownSha256,
+    })).rejects.toThrow('lowercase path-safe legacy exact slug');
+  });
+
   test('soft-delete and restore reject rendered-markdown drift inside the exact identity', async () => {
     await engine.putPage('projects/rendered-drift', {
       type: 'note', title: 'Rendered drift', compiled_truth: 'stable body', timeline: '', frontmatter: {},

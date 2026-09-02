@@ -1894,7 +1894,7 @@ const soft_delete_page_exact: Operation = {
     if (ctx.remote !== false) {
       throw new OperationError('permission_denied', 'soft_delete_page_exact is local-only and must be called through the local CLI.');
     }
-    const slug = requireLowercaseExactSlug(p.slug);
+    const slug = requireLowercaseLegacyExactSlug(p.slug);
     const expectedContentHash = requireExactString(p, 'expected_content_hash');
     const expectedPreimageMarkdownSha256 = requireExactString(p, 'expected_preimage_markdown_sha256');
     if (!/^[a-f0-9]{64}$/.test(expectedContentHash)) {
