@@ -545,6 +545,22 @@ describe('remove_link op — type/source filters', () => {
     expect(await engine.getLinks('batch-crash-from', { includeDeleted: true })).toEqual([]);
   });
 
+  test('remove_links_exact_batch accepts lowercase legacy slugs with underscores', async () => {
+    await engine.putPage('batch_legacy_from', { type: 'note', title: 'From', compiled_truth: 'from', timeline: '', frontmatter: {} });
+    await engine.putPage('batch_legacy_to', { type: 'note', title: 'To', compiled_truth: 'to', timeline: '', frontmatter: {} });
+    await engine.addLink('batch_legacy_from', 'batch_legacy_to', 'legacy', 'related', 'citation-graph');
+
+    const result = await operationsByName.remove_links_exact_batch.handler(makeCtx(), {
+      edges: [{
+        from: 'batch_legacy_from', to: 'batch_legacy_to', link_type: 'related', context: 'legacy',
+        link_source: 'citation-graph', origin_slug_is_null: true,
+        origin_field_is_null: true, resolution_type_is_null: true,
+      }],
+    }) as { status: string; confirmed_removed_count: number };
+    expect(result).toMatchObject({ status: 'removed', confirmed_removed_count: 1 });
+    expect(await engine.getLinks('batch_legacy_from', { includeDeleted: true })).toEqual([]);
+  });
+
   test('simultaneous exact removals yield one success and one zero-row failure', async () => {
     await engine.putPage('remove-exact-race-from', { type: 'note', title: 'From', compiled_truth: 'from', timeline: '', frontmatter: {} });
     await engine.putPage('remove-exact-race-to', { type: 'note', title: 'To', compiled_truth: 'to', timeline: '', frontmatter: {} });
