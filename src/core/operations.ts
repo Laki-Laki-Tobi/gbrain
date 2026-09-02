@@ -3084,9 +3084,9 @@ const remove_links_exact_batch: Operation = {
         throw new OperationError('invalid_params', `edges[${index}] must be an object`);
       }
       const edge = parseExactLinkIdentity(raw as Record<string, unknown>);
-      requireLowercaseExactSlug(edge.from_slug);
-      requireLowercaseExactSlug(edge.to_slug);
-      if (edge.origin_slug !== null) requireLowercaseExactSlug(edge.origin_slug);
+      requireLowercaseLegacyExactSlug(edge.from_slug);
+      requireLowercaseLegacyExactSlug(edge.to_slug);
+      if (edge.origin_slug !== null) requireLowercaseLegacyExactSlug(edge.origin_slug);
       return edge;
     });
     const identity = (edge: ExactLinkIdentity): string => JSON.stringify([
