@@ -401,6 +401,150 @@ describe('remove_link op — type/source filters', () => {
     expect(await engine.getLinks('remove-exact-from', { includeDeleted: true })).toEqual(remaining);
   });
 
+  test('remove_links_exact_batch preflights and removes full identities with grouped readback', async () => {
+    const op = operationsByName.remove_links_exact_batch;
+    expect(op.localOnly).toBe(true);
+    expect(op.scope).toBe('admin');
+    expect(op.mutating).toBe(true);
+    for (const slug of ['batch-exact-from', 'batch-exact-to-a', 'batch-exact-to-b']) {
+      await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: slug, timeline: '', frontmatter: {} });
+    }
+    await engine.addLink('batch-exact-from', 'batch-exact-to-a', 'a', 'related', 'citation-graph');
+    await engine.addLink('batch-exact-from', 'batch-exact-to-a', 'keep', 'related', 'manual');
+    await engine.addLink('batch-exact-from', 'batch-exact-to-b', 'b', 'mentions', 'markdown');
+
+    const result = await op.handler(makeCtx(), {
+      edges: [
+        {
+          from: 'batch-exact-from', to: 'batch-exact-to-a', link_type: 'related', context: 'a',
+          link_source: 'citation-graph', origin_slug_is_null: true,
+          origin_field_is_null: true, resolution_type_is_null: true,
+        },
+        {
+          from: 'batch-exact-from', to: 'batch-exact-to-b', link_type: 'mentions', context: 'b',
+          link_source: 'markdown', origin_slug_is_null: true,
+          origin_field_is_null: true, resolution_type_is_null: true,
+        },
+      ],
+    }) as { status: string; count: number; removed_count: number; remaining_count: number; fingerprint: string };
+    expect(result).toMatchObject({
+      status: 'removed', count: 2, removed_count: 2, remaining_count: 0,
+      preflight_absent_count: 0, confirmed_removed_count: 2,
+    });
+    expect(result.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(await engine.getLinks('batch-exact-from', { includeDeleted: true })).toEqual([
+      expect.objectContaining({ to_slug: 'batch-exact-to-a', context: 'keep', link_source: 'manual' }),
+    ]);
+  });
+
+  test('remove_links_exact_batch rejects incomplete preflight before any removal', async () => {
+    for (const slug of ['batch-preflight-from', 'batch-preflight-to-a', 'batch-preflight-to-b']) {
+      await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: slug, timeline: '', frontmatter: {} });
+    }
+    await engine.addLink('batch-preflight-from', 'batch-preflight-to-a', 'a', 'related', 'citation-graph');
+    const existing = {
+      from: 'batch-preflight-from', to: 'batch-preflight-to-a', link_type: 'related', context: 'a',
+      link_source: 'citation-graph', origin_slug_is_null: true,
+      origin_field_is_null: true, resolution_type_is_null: true,
+    };
+    const missing = {
+      from: 'batch-preflight-from', to: 'batch-preflight-to-b', link_type: 'related', context: 'missing',
+      link_source: 'citation-graph', origin_slug_is_null: true,
+      origin_field_is_null: true, resolution_type_is_null: true,
+    };
+
+    await expect(operationsByName.remove_links_exact_batch.handler(makeCtx(), {
+      edges: [existing, missing],
+    })).rejects.toThrow('exact batch preflight mismatch');
+    expect(await engine.getLinks('batch-preflight-from', { includeDeleted: true })).toHaveLength(1);
+    await expect(operationsByName.remove_links_exact_batch.handler(makeCtx(), {
+      edges: [existing, existing],
+    })).rejects.toThrow('duplicate exact identities');
+  });
+
+  test('remove_links_exact_batch returns a resumable receipt after a mid-batch failure', async () => {
+    for (const slug of ['batch-resume-from', 'batch-resume-to-a', 'batch-resume-to-b']) {
+      await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: slug, timeline: '', frontmatter: {} });
+    }
+    await engine.addLink('batch-resume-from', 'batch-resume-to-a', 'a', 'related', 'citation-graph');
+    await engine.addLink('batch-resume-from', 'batch-resume-to-b', 'b', 'related', 'citation-graph');
+    const params = [
+      {
+        from: 'batch-resume-from', to: 'batch-resume-to-a', link_type: 'related', context: 'a',
+        link_source: 'citation-graph', origin_slug_is_null: true,
+        origin_field_is_null: true, resolution_type_is_null: true,
+      },
+      {
+        from: 'batch-resume-from', to: 'batch-resume-to-b', link_type: 'related', context: 'b',
+        link_source: 'citation-graph', origin_slug_is_null: true,
+        origin_field_is_null: true, resolution_type_is_null: true,
+      },
+    ];
+    const original = engine.removeLinkExact.bind(engine);
+    let calls = 0;
+    engine.removeLinkExact = async (...args) => {
+      calls += 1;
+      if (calls === 2) throw new Error('injected failure');
+      return original(...args);
+    };
+    const partial = await operationsByName.remove_links_exact_batch.handler(makeCtx(), { edges: params }) as {
+      status: string;
+      removed_indices: number[];
+      remaining_indices: number[];
+      failure_index: number | null;
+    };
+    engine.removeLinkExact = original;
+    expect(partial).toMatchObject({ status: 'partial', removed_indices: [0], remaining_indices: [1], failure_index: 1 });
+
+    const completed = await operationsByName.remove_links_exact_batch.handler(makeCtx(), { edges: [params[1]] }) as {
+      status: string;
+      removed_count: number;
+      remaining_count: number;
+    };
+    expect(completed).toMatchObject({ status: 'removed', removed_count: 1, remaining_count: 0 });
+    expect(await engine.getLinks('batch-resume-from', { includeDeleted: true })).toEqual([]);
+  });
+
+  test('remove_links_exact_batch supports WAL-owned retry after an ambiguous crash', async () => {
+    for (const slug of ['batch-crash-from', 'batch-crash-to-a', 'batch-crash-to-b']) {
+      await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: slug, timeline: '', frontmatter: {} });
+    }
+    await engine.addLink('batch-crash-from', 'batch-crash-to-a', 'a', 'related', 'citation-graph');
+    await engine.addLink('batch-crash-from', 'batch-crash-to-b', 'b', 'related', 'citation-graph');
+    const params = [
+      {
+        from: 'batch-crash-from', to: 'batch-crash-to-a', link_type: 'related', context: 'a',
+        link_source: 'citation-graph', origin_slug_is_null: true,
+        origin_field_is_null: true, resolution_type_is_null: true,
+      },
+      {
+        from: 'batch-crash-from', to: 'batch-crash-to-b', link_type: 'related', context: 'b',
+        link_source: 'citation-graph', origin_slug_is_null: true,
+        origin_field_is_null: true, resolution_type_is_null: true,
+      },
+    ];
+    await operationsByName.remove_link_exact.handler(makeCtx(), params[0]);
+    await expect(operationsByName.remove_links_exact_batch.handler(makeCtx(), { edges: params }))
+      .rejects.toThrow('exact batch preflight mismatch');
+    expect(await engine.getLinks('batch-crash-from', { includeDeleted: true })).toHaveLength(1);
+
+    const recovered = await operationsByName.remove_links_exact_batch.handler(makeCtx(), {
+      edges: params,
+      accept_absent: true,
+    }) as {
+      status: string;
+      removed_count: number;
+      remaining_count: number;
+      preflight_absent_indices: number[];
+      confirmed_removed_indices: number[];
+    };
+    expect(recovered).toMatchObject({
+      status: 'removed', removed_count: 2, remaining_count: 0,
+      preflight_absent_indices: [0], confirmed_removed_indices: [1],
+    });
+    expect(await engine.getLinks('batch-crash-from', { includeDeleted: true })).toEqual([]);
+  });
+
   test('simultaneous exact removals yield one success and one zero-row failure', async () => {
     await engine.putPage('remove-exact-race-from', { type: 'note', title: 'From', compiled_truth: 'from', timeline: '', frontmatter: {} });
     await engine.putPage('remove-exact-race-to', { type: 'note', title: 'To', compiled_truth: 'to', timeline: '', frontmatter: {} });
