@@ -155,6 +155,7 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
       'soft_delete_page_exact',
       'restore_page_exact',
       'remove_link_exact',
+      'remove_links_exact_batch',
       'inventory_deleted_pages_exact',
       'inventory_soft_delete_candidates_exact',
       'inventory_soft_delete_backlinks_exact',
@@ -234,6 +235,14 @@ describe('handler invocation — historically-broken trust-boundary classes', ()
       origin_slug_is_null: true,
       origin_field_is_null: true,
       resolution_type_is_null: true,
+    })).rejects.toThrow('local-only');
+  });
+
+  test('remove_links_exact_batch rejects ctx.remote=true as defense in depth', async () => {
+    const removeLinksExactBatch = operations.find(op => op.name === 'remove_links_exact_batch');
+    expect(removeLinksExactBatch).toBeDefined();
+    await expect(removeLinksExactBatch!.handler(makeContext({ remote: true }), {
+      edges: [],
     })).rejects.toThrow('local-only');
   });
 

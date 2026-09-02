@@ -3062,6 +3062,117 @@ const remove_link_exact: Operation = {
   },
 };
 
+const remove_links_exact_batch: Operation = {
+  name: 'remove_links_exact_batch',
+  description: 'Local-admin bounded batch removal of exact link identities with complete preflight and grouped readback.',
+  params: {
+    edges: { type: 'array', required: true, items: { type: 'object' } },
+    accept_absent: { type: 'boolean', description: 'Recovery-only: accept exact identities already absent at preflight.' },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: true,
+  handler: async (ctx, p) => {
+    if (ctx.remote !== false) {
+      throw new OperationError('permission_denied', 'remove_links_exact_batch is local-only and must be called through the local CLI.');
+    }
+    if (!Array.isArray(p.edges) || p.edges.length < 1 || p.edges.length > 500) {
+      throw new OperationError('invalid_params', 'edges must contain between 1 and 500 exact identities');
+    }
+    const edges = p.edges.map((raw, index) => {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new OperationError('invalid_params', `edges[${index}] must be an object`);
+      }
+      const edge = parseExactLinkIdentity(raw as Record<string, unknown>);
+      requireLowercaseExactSlug(edge.from_slug);
+      requireLowercaseExactSlug(edge.to_slug);
+      if (edge.origin_slug !== null) requireLowercaseExactSlug(edge.origin_slug);
+      return edge;
+    });
+    const identity = (edge: ExactLinkIdentity): string => JSON.stringify([
+      edge.from_slug,
+      edge.to_slug,
+      edge.link_type,
+      edge.context,
+      edge.link_source,
+      edge.origin_slug,
+      edge.origin_field,
+      edge.resolution_type,
+    ]);
+    const identities = edges.map(identity);
+    if (new Set(identities).size !== identities.length) {
+      throw new OperationError('invalid_params', 'edges must not contain duplicate exact identities');
+    }
+    const sourceId = ctx.sourceId || 'default';
+    const acceptAbsent = p.accept_absent === true;
+    const byFrom = new Map<string, ExactLinkIdentity[]>();
+    for (const edge of edges) {
+      const group = byFrom.get(edge.from_slug) || [];
+      group.push(edge);
+      byFrom.set(edge.from_slug, group);
+    }
+    const preflightPresent = new Set<string>();
+    const preflightAbsent = new Set<string>();
+    for (const [fromSlug, group] of byFrom) {
+      const live = await ctx.engine.getLinks(fromSlug, { sourceIds: [sourceId], includeDeleted: true });
+      for (const edge of group) {
+        const matches = live.filter((link) => linkIdentityMatches(link, edge)).length;
+        if (matches > 1 || matches === 0 && !acceptAbsent) {
+          throw new OperationError('storage_error', `exact batch preflight mismatch for ${edge.from_slug} -> ${edge.to_slug}`);
+        }
+        (matches === 1 ? preflightPresent : preflightAbsent).add(identity(edge));
+      }
+    }
+    if (ctx.dryRun) {
+      return {
+        dry_run: true,
+        action: 'remove_links_exact_batch',
+        count: edges.length,
+        preflight_present_count: preflightPresent.size,
+        preflight_absent_count: preflightAbsent.size,
+      };
+    }
+    let failureIndex: number | null = null;
+    const successfulCalls = new Set<string>();
+    for (let index = 0; index < edges.length; index += 1) {
+      if (!preflightPresent.has(identities[index])) continue;
+      try {
+        await ctx.engine.removeLinkExact(edges[index], { sourceId });
+        successfulCalls.add(identities[index]);
+      } catch {
+        failureIndex = index;
+        break;
+      }
+    }
+    const remaining = new Set<string>();
+    for (const [fromSlug, group] of byFrom) {
+      const live = await ctx.engine.getLinks(fromSlug, { sourceIds: [sourceId], includeDeleted: true });
+      for (const edge of group) {
+        if (live.some((link) => linkIdentityMatches(link, edge))) remaining.add(identity(edge));
+      }
+    }
+    const fingerprint = createHash('sha256').update(JSON.stringify([...identities].sort())).digest('hex');
+    const removedIndices = identities.flatMap((value, index) => remaining.has(value) ? [] : [index]);
+    const remainingIndices = identities.flatMap((value, index) => remaining.has(value) ? [index] : []);
+    const preflightAbsentIndices = identities.flatMap((value, index) => preflightAbsent.has(value) ? [index] : []);
+    const confirmedRemovedIndices = identities.flatMap((value, index) => successfulCalls.has(value) && !remaining.has(value) ? [index] : []);
+    return {
+      status: remainingIndices.length === 0 ? 'removed' : 'partial',
+      count: edges.length,
+      removed_count: removedIndices.length,
+      remaining_count: remainingIndices.length,
+      removed_indices: removedIndices,
+      remaining_indices: remainingIndices,
+      preflight_absent_count: preflightAbsentIndices.length,
+      preflight_absent_indices: preflightAbsentIndices,
+      confirmed_removed_count: confirmedRemovedIndices.length,
+      confirmed_removed_indices: confirmedRemovedIndices,
+      failure_index: failureIndex,
+      fingerprint,
+    };
+  },
+};
+
 const EXACT_METADATA_KEYS = new Set([
   'status',
   'memory_tier',
@@ -6712,7 +6823,7 @@ export const operations: Operation[] = [
   // Tags
   add_tag, remove_tag, get_tags,
   // Links
-  add_link, remove_link, restore_link_exact, remove_link_exact, get_links, get_backlinks, list_link_sources, traverse_graph,
+  add_link, remove_link, restore_link_exact, remove_link_exact, remove_links_exact_batch, get_links, get_backlinks, list_link_sources, traverse_graph,
   // Timeline
   add_timeline_entry, get_timeline,
   // Admin
