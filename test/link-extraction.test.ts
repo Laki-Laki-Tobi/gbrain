@@ -1031,6 +1031,22 @@ describe('makeResolver — fallback chain', () => {
     expect(await r.resolve('people/pedro')).toBe('people/pedro');
   });
 
+  test('step 1: root-level slug passthrough', async () => {
+    const engine = makeFakeEngine(['aura7-c360-uc0-overview-2026-04-29']);
+    const r = makeResolver(engine, { mode: 'batch', sourceId: 'default' });
+    expect(await r.resolve('aura7-c360-uc0-overview-2026-04-29')).toBe(
+      'aura7-c360-uc0-overview-2026-04-29',
+    );
+    expect((engine as any)._counts()).toEqual({ getPageCalls: 1, fuzzyCalls: 0, searchCalls: 0 });
+  });
+
+  test('step 1: directory hint wins over a colliding root-level slug', async () => {
+    const engine = makeFakeEngine(['acme', 'companies/acme']);
+    const r = makeResolver(engine, { mode: 'batch', sourceId: 'default' });
+    expect(await r.resolve('acme', 'companies')).toBe('companies/acme');
+    expect((engine as any)._counts()).toEqual({ getPageCalls: 1, fuzzyCalls: 0, searchCalls: 0 });
+  });
+
   test('step 2: dir-hint construction', async () => {
     const engine = makeFakeEngine(['companies/stripe']);
     const r = makeResolver(engine);

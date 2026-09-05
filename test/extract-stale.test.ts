@@ -119,6 +119,39 @@ describe('gbrain extract --stale', () => {
     expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
   });
 
+  test('--source-id scopes root-level frontmatter exact lookup', async () => {
+    await engine.putPage('root-target', {
+      type: 'concept',
+      title: 'Root Target',
+      compiled_truth: '',
+      timeline: '',
+    });
+    await engine.putPage('origin', {
+      type: 'concept',
+      title: 'Origin',
+      compiled_truth: '',
+      timeline: '',
+      frontmatter: { related: ['root-target'] },
+    });
+
+    const originalGetPage = engine.getPage.bind(engine);
+    const targetLookupSources: Array<string | undefined> = [];
+    (engine as unknown as { getPage: typeof engine.getPage }).getPage = async (slug, opts) => {
+      if (slug === 'root-target') targetLookupSources.push(opts?.sourceId);
+      return originalGetPage(slug, opts);
+    };
+    try {
+      await runExtract(engine, ['--stale', '--include-frontmatter', '--source-id', 'default']);
+    } finally {
+      (engine as unknown as { getPage: typeof engine.getPage }).getPage = originalGetPage;
+    }
+
+    expect(targetLookupSources).toContain('default');
+    expect(targetLookupSources).not.toContain(undefined);
+    const links = await engine.getLinks('origin');
+    expect(links.some(link => link.to_slug === 'root-target' && link.link_source === 'frontmatter')).toBe(true);
+  });
+
   test('idempotent: second run finds 0 stale and creates no new links', async () => {
     await engine.putPage('people/alice', personPage('Alice'));
     await engine.putPage('companies/acme', companyPage('Acme', '[Alice](people/alice) advises [Acme](companies/acme).'));
