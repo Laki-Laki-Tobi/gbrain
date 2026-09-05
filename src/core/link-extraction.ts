@@ -957,10 +957,11 @@ export function makeResolver(
 
       const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
 
-      // Step 1: exact lookup for any lowercase slug-shaped path, including
-      // digit-leading folders and nested paths. A miss still falls through to
-      // the existing hint/fuzzy resolution without inventing a target.
-      if (/\//.test(trimmed) && /^[a-z0-9][a-z0-9/_-]*$/.test(trimmed)) {
+      // Step 1: exact lookup for qualified paths and unhinted root-level
+      // slugs. A hint still wins for display names such as `acme` when both
+      // `acme` and `companies/acme` exist. A miss falls through without
+      // inventing a target.
+      if (/^[a-z0-9][a-z0-9/_-]*$/.test(trimmed) && (trimmed.includes('/') || hints.length === 0)) {
         const page = await engine.getPage(trimmed, sourceOpts);
         if (page) {
           cache.set(cacheKey, trimmed);
